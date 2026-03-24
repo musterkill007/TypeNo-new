@@ -3,14 +3,16 @@
 ![TypeNo hero image](assets/hero.webp)
 
 > A free, open source, privacy-first voice input tool for macOS.
+>
+> Press Control, speak, done.
+
+A minimal macOS voice input app. TypeNo captures your voice, transcribes it locally, and pastes the result into whatever app you were using — all in under a second.
+
 > 免费、开源、隐私优先的 macOS 语音输入工具。
+>
+> 按下 Control，说话，完成。
 
-Press Control, speak, done.
-按下 Control，说话，完成。
-
-A minimal macOS voice input app. Press Control, speak, done.
-
-TypeNo captures your voice, transcribes it locally, and pastes the result into whatever app you were using — all in under a second.
+TypeNo 是一个极简的 macOS 语音输入应用。它会录下你的声音，在本地完成转录，然后自动粘贴到你正在使用的应用中。
 
 Official website: [https://typeno.com](https://typeno.com)
 
@@ -59,8 +61,10 @@ TypeNo will support proper Apple code signing and notarization in a future relea
 TypeNo uses [coli](https://github.com/marswaveai/coli) for local speech recognition:
 
 ```bash
-npm i -g @coli.codes/coli
+npm install -g @marswave/coli
 ```
+
+If Coli is missing, TypeNo will show an in-app setup prompt with the install command and a **Try Again** action after installation.
 
 ### First Launch
 

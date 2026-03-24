@@ -45,6 +45,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.refreshPermissionGuidance()
         }
 
+        appState.onColiInstallHelpRequest = { [weak self] in
+            self?.openColiInstallHelp()
+        }
+
+        appState.onColiRetryRequest = { [weak self] in
+            self?.refreshColiGuidance()
+        }
+
         appState.onCancel = { [weak self] in
             self?.cancelFlow()
         }
@@ -64,7 +72,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             stopRecording()
         case .done:
             appState.confirmInsert()
-        case .transcribing, .error, .permissions:
+        case .transcribing, .error, .permissions, .missingColi:
             break
         }
     }
@@ -106,12 +114,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         PermissionManager.openPrivacySettings(for: [kind])
     }
 
+    private func openColiInstallHelp() {
+        guard let url = URL(string: "https://github.com/marswaveai/coli") else { return }
+        NSWorkspace.shared.open(url)
+    }
+
     private func refreshPermissionGuidance() {
         let missing = PermissionManager.missingPermissions(requestMicrophoneIfNeeded: false)
         if missing.isEmpty {
             appState.hidePermissions()
         } else {
             appState.showPermissions(missing)
+        }
+    }
+
+    private func refreshColiGuidance() {
+        if ColiASRService.isInstalled {
+            appState.hideColiGuidance()
+        } else {
+            appState.showMissingColi()
         }
     }
 }
@@ -150,6 +171,7 @@ enum AppPhase: Equatable {
     case transcribing
     case done(String)        // transcription result, waiting for user confirm
     case permissions(Set<PermissionKind>)
+    case missingColi
     case error(String)
 
     var subtitle: String {
@@ -158,7 +180,7 @@ enum AppPhase: Equatable {
         case .recording: "Listening..."
         case .transcribing: "Transcribing..."
         case .done(let text): text
-        case .permissions: ""
+        case .permissions, .missingColi: ""
         case .error(let message): message
         }
     }
@@ -174,6 +196,8 @@ final class AppState: ObservableObject {
     var onOverlayRequest: ((Bool) -> Void)?
     var onPermissionOpen: ((PermissionKind) -> Void)?
     var onPermissionRetryRequest: (() -> Void)?
+    var onColiInstallHelpRequest: (() -> Void)?
+    var onColiRetryRequest: (() -> Void)?
     var onCancel: (() -> Void)?
     var onConfirm: (() -> Void)?
     var onToggleRequest: (() -> Void)?
@@ -222,6 +246,18 @@ final class AppState: ObservableObject {
         onOverlayRequest?(false)
     }
 
+    func showMissingColi() {
+        phase = .missingColi
+        onOverlayRequest?(true)
+    }
+
+    func hideColiGuidance() {
+        if case .missingColi = phase {
+            phase = .idle
+            onOverlayRequest?(false)
+        }
+    }
+
     func showError(_ message: String) {
         phase = .error(message)
         onOverlayRequest?(true)
@@ -247,6 +283,8 @@ final class AppState: ObservableObject {
             phase = .done(transcript)
             onOverlayRequest?(true)
             confirmInsert()
+        } catch TypeNoError.coliNotInstalled {
+            showMissingColi()
         } catch {
             showError(error.localizedDescription)
         }
@@ -313,6 +351,8 @@ final class AppState: ObservableObject {
             phase = .done(transcript)
             onOverlayRequest?(true)
             confirmInsert()
+        } catch TypeNoError.coliNotInstalled {
+            showMissingColi()
         } catch {
             showError(error.localizedDescription)
         }
@@ -331,7 +371,7 @@ enum TypeNoError: LocalizedError {
         switch self {
         case .noRecording: "No recording"
         case .emptyTranscript: "No speech detected"
-        case .coliNotInstalled: "coli not found. Install: npm i -g @coli.codes/coli"
+        case .coliNotInstalled: "TypeNo needs the local Coli engine. Install it with: npm install -g @marswave/coli"
         case .transcriptionFailed(let message): message
         }
     }
@@ -429,6 +469,10 @@ final class AudioRecorder: NSObject, AVAudioRecorderDelegate {
 // MARK: - ASR Service
 
 struct ColiASRService {
+    static var isInstalled: Bool {
+        findColiPath() != nil
+    }
+
     func transcribe(fileURL: URL) async throws -> String {
         guard let coliPath = Self.findColiPath() else {
             throw TypeNoError.coliNotInstalled
@@ -481,14 +525,24 @@ struct ColiASRService {
     }
 
     private static func findColiPath() -> String? {
-        let home = ProcessInfo.processInfo.environment["HOME"] ?? ""
-        let candidates = [
-            "/opt/homebrew/bin/coli",
-            "/usr/local/bin/coli",
-            home + "/.npm-global/bin/coli",
-            home + "/.bun/bin/coli"
+        let env = ProcessInfo.processInfo.environment
+        let home = env["HOME"] ?? ""
+
+        let pathEntries = (env["PATH"] ?? "")
+            .split(separator: ":")
+            .map { String($0) }
+            .filter { !$0.isEmpty }
+
+        let fallbackEntries = [
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            home + "/.npm-global/bin",
+            home + "/.bun/bin",
+            home + "/.nvm/current/bin",
+            "/opt/homebrew/opt/node/bin"
         ]
 
+        let candidates = Array(NSOrderedSet(array: (pathEntries + fallbackEntries).map { ($0 as NSString).appendingPathComponent("coli") })) as? [String] ?? []
         return candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) })
     }
 }
@@ -621,7 +675,7 @@ final class StatusItemController: NSObject {
         case .recording: "Rec"
         case .transcribing: "..."
         case .done: "✓"
-        case .permissions: "!"
+        case .permissions, .missingColi: "!"
         case .error: "!"
         }
     }
@@ -726,6 +780,8 @@ final class OverlayPanelController {
             if case .permissions = appState.phase {
                 // Onboarding: center of screen
                 y = frame.midY - height / 2
+            } else if case .missingColi = appState.phase {
+                y = frame.midY - height / 2
             } else {
                 // Recording/transcription bar: near bottom
                 y = frame.minY + 48
@@ -753,6 +809,8 @@ struct OverlayView: View {
             switch appState.phase {
             case .permissions(let missing):
                 permissionView(missing: missing)
+            case .missingColi:
+                missingColiView
             case .idle:
                 EmptyView()
             default:
@@ -849,6 +907,61 @@ struct OverlayView: View {
         }
         .padding(16)
         .frame(width: 380)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5)
+        )
+    }
+
+    var missingColiView: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 12) {
+                Image(systemName: "waveform.badge.exclamationmark")
+                    .font(.system(size: 16))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 24)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Install Coli to continue")
+                        .font(.system(size: 13, weight: .medium))
+                    Text("TypeNo uses the local Coli speech engine. Install it once, then come back and click Try Again.")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                }
+
+                Spacer()
+
+                Button("Open Guide") {
+                    appState.onColiInstallHelpRequest?()
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+            }
+
+            Text("npm install -g @marswave/coli")
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .padding(.leading, 36)
+
+            HStack {
+                Spacer()
+                Button("Try Again") {
+                    appState.onColiRetryRequest?()
+                }
+                .buttonStyle(.borderless)
+                .font(.system(size: 12))
+
+                Button("Cancel") {
+                    appState.onCancel?()
+                }
+                .buttonStyle(.borderless)
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+            }
+        }
+        .padding(16)
+        .frame(width: 400)
         .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 12, style: .continuous)

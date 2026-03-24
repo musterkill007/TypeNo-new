@@ -56,8 +56,10 @@ TypeNo 会在后续版本中支持正式的 Apple 签名与公证。
 TypeNo 使用 [coli](https://github.com/marswaveai/coli) 进行本地语音识别：
 
 ```bash
-npm i -g @coli.codes/coli
+npm install -g @marswave/coli
 ```
+
+如果系统里还没有安装 Coli，TypeNo 会在应用内弹出引导，告诉用户安装命令，并在安装完成后支持点击 **Try Again** 重试。
 
 ### 首次启动
 
