@@ -2,6 +2,9 @@
 
 ![TypeNo hero image](assets/hero.webp)
 
+> A free, open source, privacy-first voice input tool for macOS.
+> Press Control, speak, done.
+
 A minimal macOS voice input app. Press Control, speak, done.
 
 TypeNo captures your voice, transcribes it locally, and pastes the result into whatever app you were using — all in under a second.

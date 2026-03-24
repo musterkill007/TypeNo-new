@@ -2,6 +2,9 @@
 
 ![TypeNo 宣传图](assets/hero.webp)
 
+> 免费、开源、隐私优先的 macOS 语音输入工具。
+> 按下 Control，说话，完成。
+
 一个极简的 macOS 语音输入应用。按下 Control，说话，完成。
 
 TypeNo 录下你的声音，本地转录，然后自动粘贴到你正在使用的应用中 —— 全程不到一秒。
