@@ -29,21 +29,7 @@
 - 解压后将 `TypeNo.app` 拖到 `/Applications`
 - 打开 TypeNo
 
-#### 如果 macOS 提示应用已损坏
-
-当前版本尚未经过 Apple 公证，macOS 可能会拦截应用。
-
-请按顺序尝试：
-
-1. 在 Finder 中右键 `TypeNo.app`，选择 **打开**
-2. 如果看到 **系统设置 → 隐私与安全性 → 仍要打开**，走这条路径
-3. 如果仍被阻止，在终端中执行：
-
-```bash
-xattr -dr com.apple.quarantine "/Applications/TypeNo.app"
-```
-
-4. 再次打开 `TypeNo.app`
+TypeNo 已通过 Apple 签名和公证，可以直接打开使用。
 
 ### 安装语音识别引擎
 

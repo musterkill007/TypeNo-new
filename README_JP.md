@@ -29,17 +29,7 @@
 - 解凍して `TypeNo.app` を `/Applications` に移動
 - TypeNo を起動
 
-#### macOS がアプリを破損と表示する場合
-
-現在のリリースはまだ Apple の公証を通していないため、macOS がブロックすることがあります。
-
-1. Finder で `TypeNo.app` を右クリックして **開く** を選ぶ
-2. **システム設定 → プライバシーとセキュリティ → このまま開く** が表示される場合はそちらを使用
-3. それでもブロックされる場合は Terminal で：
-
-```bash
-xattr -dr com.apple.quarantine "/Applications/TypeNo.app"
-```
+TypeNo は Apple の署名と公証済みです。警告なしでそのまま開けます。
 
 ### 音声認識エンジンをインストール
 

@@ -30,21 +30,7 @@ That's it. No windows, no settings, no accounts.
 - Move `TypeNo.app` to `/Applications`
 - Open TypeNo
 
-#### If macOS says the app is damaged
-
-Current releases are not yet notarized by Apple, so macOS may block the app after download.
-
-Try these steps in order:
-
-1. Right-click `TypeNo.app` in Finder and choose **Open**
-2. If you see **System Settings → Privacy & Security → Open Anyway**, use that path
-3. If macOS still blocks it, remove the quarantine flag in Terminal:
-
-```bash
-xattr -dr com.apple.quarantine "/Applications/TypeNo.app"
-```
-
-4. Open `TypeNo.app` again
+TypeNo is signed and notarized by Apple — it should open without any warnings.
 
 ### Install the speech engine
 
