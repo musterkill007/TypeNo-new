@@ -1,6 +1,6 @@
 # TypeNo
 
-[中文](README_CN.md) | [日本語](README_JP.md)
+[中文](README_CN.md)
 
 **A free, open source, privacy-first voice input tool for macOS.**
 
@@ -17,9 +17,20 @@ Special thanks to [marswave ai's coli project](https://github.com/marswaveai/col
 1. **Short-press Control** to start recording
 2. **Short-press Control** again to stop
 3. Text is automatically transcribed and pasted into your active app (also copied to clipboard)
-4. While recording, the overlay shows segmented preview text about once per second; after you stop, TypeNo still runs a final full-file transcription before pasting
+4. While recording, TypeNo lives around the MacBook notch: a compact recording dot and timer stay beside the notch, and the preview expands downward when you hover or click
+5. After you stop, TypeNo runs a final full-file transcription before pasting, so the inserted text is based on the complete recording
 
 That's it. No windows, no settings, no accounts.
+
+## Notch Island Preview
+
+TypeNo now uses a notch-attached overlay inspired by Dynamic Island:
+
+- **Idle history entry:** when you are not recording, click the compact history icon beside the notch to reopen recent transcripts and copy them again.
+- **Recording status:** while recording, the notch area shows a compact recording indicator and elapsed time.
+- **Expandable preview:** hover or click the notch island to expand a transcription preview. Long text wraps and scrolls inside the panel.
+- **Fullscreen-friendly:** when another app is in fullscreen, TypeNo hides the idle floating history entry by default. Starting a recording still shows the recording island.
+- **Lower heat:** realtime preview is started only when the preview is expanded; final transcription still uses the full audio after recording stops.
 
 ## Install
 
@@ -97,7 +108,9 @@ The app will be at `dist/TypeNo.app`. Move it to `/Applications/` for persistent
 |---|---|
 | Start/stop recording | Short-press `Control` (< 300ms, no other keys) |
 | Start/stop recording | Menu bar → Record |
-| Watch incremental transcription | Overlay updates about once per second while processing |
+| Expand recording preview | Hover or click the notch island while recording |
+| Reopen transcript history | Click the compact history entry beside the notch while idle |
+| Watch incremental transcription | Expand the notch preview while recording; final paste still uses full-file transcription |
 | Choose microphone | Menu bar → Microphone → Automatic / specific device |
 | Transcribe a file | Drag `.m4a`/`.mp3`/`.wav`/`.aac` to the menu bar icon |
 | Check for updates | Menu bar → Check for Updates... |

@@ -3,7 +3,9 @@ import ApplicationServices
 @preconcurrency import AVFoundation
 import Combine
 import Foundation
+import QuartzCore
 import SwiftUI
+import TypeNoCore
 
 // MARK: - Localization Helper
 
@@ -151,6 +153,19 @@ extension Notification.Name {
     static let hotkeyConfigChanged = Notification.Name("ai.marswave.typeno.hotkeyConfigChanged")
 }
 
+extension NSScreen {
+    static var typenoNotchPreferred: NSScreen? {
+        screens.first { $0.typenoIsBuiltInDisplay } ?? main
+    }
+
+    private var typenoIsBuiltInDisplay: Bool {
+        guard let screenNumber = deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID else {
+            return false
+        }
+
+        return CGDisplayIsBuiltin(screenNumber) != 0
+    }
+}
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -179,6 +194,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             name: .hotkeyConfigChanged,
             object: nil
         )
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(workspaceContextDidChange),
+            name: NSWorkspace.didActivateApplicationNotification,
+            object: nil
+        )
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(workspaceContextDidChange),
+            name: NSWorkspace.activeSpaceDidChangeNotification,
+            object: nil
+        )
 
         appState.onToggleRequest = { [weak self] in
             self?.handleToggle()
@@ -190,6 +217,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             } else {
                 self?.overlayController?.hide()
             }
+        }
+
+        appState.onRecordingIslandHoverRegionCheck = { [weak self] in
+            self?.overlayController?.isMouseInsideRecordingIslandRegion() ?? false
         }
 
         appState.onPermissionOpen = { [weak self] kind in
@@ -211,11 +242,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Auto-poll permissions and coli install status
         pollTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
             Task { @MainActor in
+                self?.refreshFullscreenIdleIslandSuppression()
                 self?.pollStatus()
             }
         }
 
         hotkeyMonitor?.start()
+        refreshFullscreenIdleIslandSuppression()
+
+        seedDebugHistoryIfNeeded()
+        startDebugAutoRecordingIfNeeded()
 
         // Silent update check on launch
         Task {
@@ -223,6 +259,82 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 statusItemController?.setUpdateAvailable(release.version)
             }
         }
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        pollTimer?.invalidate()
+        NotificationCenter.default.removeObserver(self)
+        NSWorkspace.shared.notificationCenter.removeObserver(self)
+    }
+
+    private func seedDebugHistoryIfNeeded() {
+        let environment = ProcessInfo.processInfo.environment
+        if let previewText = environment["TYPENO_DEBUG_PREVIEW_TEXT"] {
+            appState.phase = .recording
+            appState.previewTranscript = previewText
+            appState.islandHovering = environment["TYPENO_DEBUG_PREVIEW_COLLAPSED"] != "1"
+            appState.onOverlayRequest?(true)
+            return
+        }
+
+        guard environment["TYPENO_DEBUG_SEED_HISTORY"] == "1" else {
+            return
+        }
+
+        let historyTexts: [String]
+        if let historyItems = environment["TYPENO_DEBUG_HISTORY_ITEMS"] {
+            historyTexts = historyItems
+                .components(separatedBy: "||")
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+        } else {
+            historyTexts = [
+                environment["TYPENO_DEBUG_HISTORY_TEXT"]
+                    ?? "Debug history item for notch placement verification."
+            ]
+        }
+        for text in historyTexts.reversed() {
+            appState.transcriptHistory.record(text)
+        }
+        let suppressIdleIsland = environment["TYPENO_DEBUG_FULLSCREEN_SUPPRESSED"] == "1"
+        appState.setIdleIslandSuppressedForFullscreen(suppressIdleIsland)
+        appState.historyOpen = !suppressIdleIsland && environment["TYPENO_DEBUG_OPEN_HISTORY"] == "1"
+        appState.onOverlayRequest?(appState.shouldShowIdleIsland)
+    }
+
+    private func startDebugAutoRecordingIfNeeded() {
+        let environment = ProcessInfo.processInfo.environment
+        guard environment["TYPENO_DEBUG_AUTO_RECORD"] == "1" else {
+            return
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+            guard let self else { return }
+            do {
+                try self.appState.startRecording()
+                if environment["TYPENO_DEBUG_AUTO_RECORD_EXPANDED"] == "1" {
+                    self.appState.setIslandHovering(true)
+                }
+            } catch {
+                self.appState.showError(error.localizedDescription)
+            }
+        }
+    }
+
+    @objc private func workspaceContextDidChange(_ notification: Notification) {
+        refreshFullscreenIdleIslandSuppression()
+    }
+
+    private func refreshFullscreenIdleIslandSuppression() {
+        if ProcessInfo.processInfo.environment["TYPENO_DEBUG_FULLSCREEN_SUPPRESSED"] == "1" {
+            appState.setIdleIslandSuppressedForFullscreen(true)
+            return
+        }
+
+        guard let frontmostAppIsFullscreen = ActiveAppFullscreenDetector.frontmostExternalApplicationIsFullscreen() else {
+            return
+        }
+        appState.setIdleIslandSuppressedForFullscreen(frontmostAppIsFullscreen)
     }
 
     private func pollStatus() {
@@ -283,6 +395,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             permissionsGranted = true
         }
 
+        guard ColiASRService.isInstalled else {
+            appState.showMissingColi()
+            return
+        }
+
         do {
             try appState.startRecording()
         } catch {
@@ -338,6 +455,78 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 NSWorkspace.shared.open(URL(string: "https://github.com/\(UpdateService.repoOwner)/\(UpdateService.repoName)/releases/latest")!)
             }
         }
+    }
+}
+
+enum ActiveAppFullscreenDetector {
+    private static let fullScreenAttribute = "AXFullScreen"
+
+    static func frontmostExternalApplicationIsFullscreen() -> Bool? {
+        guard let application = NSWorkspace.shared.frontmostApplication else {
+            return false
+        }
+
+        if application.bundleIdentifier == Bundle.main.bundleIdentifier {
+            return nil
+        }
+
+        return applicationIsFullscreen(application)
+    }
+
+    private static func applicationIsFullscreen(_ application: NSRunningApplication) -> Bool {
+        let applicationElement = AXUIElementCreateApplication(application.processIdentifier)
+
+        if windowAttributeIsFullscreen(kAXFocusedWindowAttribute, in: applicationElement) {
+            return true
+        }
+        if windowAttributeIsFullscreen(kAXMainWindowAttribute, in: applicationElement) {
+            return true
+        }
+
+        var windowsValue: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+            applicationElement,
+            kAXWindowsAttribute as CFString,
+            &windowsValue
+        ) == .success else {
+            return false
+        }
+
+        guard let windows = windowsValue as? [AXUIElement] else {
+            return false
+        }
+
+        return windows.contains { windowIsFullscreen($0) }
+    }
+
+    private static func windowAttributeIsFullscreen(_ attribute: String, in applicationElement: AXUIElement) -> Bool {
+        var windowValue: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+            applicationElement,
+            attribute as CFString,
+            &windowValue
+        ) == .success,
+            let window = windowValue,
+            CFGetTypeID(window) == AXUIElementGetTypeID() else {
+            return false
+        }
+
+        return windowIsFullscreen(window as! AXUIElement)
+    }
+
+    private static func windowIsFullscreen(_ window: AXUIElement) -> Bool {
+        var fullscreenValue: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+            window,
+            fullScreenAttribute as CFString,
+            &fullscreenValue
+        ) == .success,
+            let fullscreenValue,
+            CFGetTypeID(fullscreenValue) == CFBooleanGetTypeID() else {
+            return false
+        }
+
+        return CFBooleanGetValue((fullscreenValue as! CFBoolean))
     }
 }
 
@@ -406,6 +595,23 @@ struct PreviewStreamPayload: Sendable {
     let isFinal: Bool
 }
 
+private final class PreviewAudioGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var enabled = false
+
+    func setEnabled(_ enabled: Bool) {
+        lock.lock()
+        self.enabled = enabled
+        lock.unlock()
+    }
+
+    func isEnabled() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return enabled
+    }
+}
+
 // MARK: - App State
 
 @MainActor
@@ -413,6 +619,29 @@ final class AppState: ObservableObject {
     @Published var phase: AppPhase = .idle
     var transcript = ""
     @Published var previewTranscript = ""
+    @Published var islandHovering = false
+    @Published var islandPinnedOpen = false
+    @Published var historyOpen = false
+    @Published var suppressIdleIslandForFullscreenApp = false
+    @Published var transcriptHistory = TranscriptHistory()
+    @Published var islandWidth = CompactIslandMetrics.width
+    @Published var collapsedRecordingRailWidth = CompactIslandMetrics.collapsedRecordingWidth
+    @Published var historyPanelWidth = CompactIslandMetrics.historyPanelMinimumWidth
+    @Published var previewPanelWidth = CompactIslandMetrics.previewPanelMinimumWidth
+    @Published var collapsedRecordingSpacerWidth = CompactIslandMetrics.collapsedRecordingSpacerWidth(
+        for: ScreenGeometry(frame: .zero, visibleFrame: .zero, safeAreaTop: 0)
+    )
+    @Published var notchAttachmentHeight: CGFloat = 0
+    @Published var usesTopOverlayHost = false
+    @Published var overlayHostWidth: CGFloat = CompactIslandMetrics.width
+    @Published var overlayHostHeight: CGFloat = 420
+    @Published var overlayContentX: CGFloat = 0
+    @Published var overlayContentY: CGFloat = 0
+    @Published var overlayContentWidth: CGFloat = CompactIslandMetrics.width
+    @Published var overlayContentHeight: CGFloat = CompactIslandMetrics.minimumHeight
+    @Published var overlayPreviewTextViewportHeight: CGFloat = 18
+    @Published var overlayHistoryRowsViewportHeight: CGFloat = 26
+    @Published var overlayLayoutPlan: OverlayLayoutPlan?
 
     var onOverlayRequest: ((Bool) -> Void)?
     var onPermissionOpen: ((PermissionKind) -> Void)?
@@ -420,13 +649,24 @@ final class AppState: ObservableObject {
     var onConfirm: (() -> Void)?
     var onToggleRequest: (() -> Void)?
     var onUpdateRequest: (() -> Void)?
+    var onRecordingIslandHoverRegionCheck: (() -> Bool)?
 
     private let recorder = AudioRecorder()
     private let asrService = ColiASRService()
     private var currentRecordingURL: URL?
     private var previousApp: NSRunningApplication?
     private var recordingTimer: Timer?
+    private var hoverCollapseWorkItem: DispatchWorkItem?
+    private var previewOverlayRefreshWorkItem: DispatchWorkItem?
+    private var previewStreamShutdownWorkItem: DispatchWorkItem?
+    private var lastPreviewOverlayRefreshAt: CFTimeInterval = 0
+    private let previewOverlayRefreshInterval: CFTimeInterval = 0.12
+    private let previewStreamIdleShutdownDelay: TimeInterval = 3.0
     private var previewActive = false
+    private var previewStreamActive = false
+    private let previewAudioGate = PreviewAudioGate()
+    private var measuredPreviewTextSize: CGSize = CGSize(width: 0, height: 18)
+    private var measuredHistoryRowSizes: [UUID: CGSize] = [:]
     @Published var recordingElapsedSeconds: Int = 0
 
     var recordingElapsedStr: String {
@@ -438,19 +678,31 @@ final class AppState: ObservableObject {
     func startRecording() throws {
         transcript = ""
         previewTranscript = ""
+        measuredPreviewTextSize = CGSize(width: 0, height: 18)
+        overlayPreviewTextViewportHeight = 18
+        islandPinnedOpen = false
+        historyOpen = false
+        islandHovering = false
+        cancelRecordingHoverCollapse()
+        cancelPreviewOverlayRefresh()
+        cancelPreviewStreamShutdown()
+        lastPreviewOverlayRefreshAt = 0
         previewActive = true
+        previewStreamActive = false
+        previewAudioGate.setEnabled(false)
         previousApp = NSWorkspace.shared.frontmostApplication
+        let previewASRService = asrService
+        let previewAudioGate = previewAudioGate
         let microphone = try MicrophoneManager.resolvedDevice(for: UserDefaults.standard.microphoneSelection)
-        currentRecordingURL = try recorder.start(using: microphone) { [weak self] payload in
-            Task { @MainActor in
-                self?.handlePreviewAudioPayload(payload)
+        currentRecordingURL = try recorder.start(
+            using: microphone,
+            shouldStreamPreviewAudio: {
+                previewAudioGate.isEnabled()
+            },
+            streamHandler: { payload in
+                previewASRService.sendPreviewAudio(payload.data, isFinal: payload.isFinal)
             }
-        }
-        asrService.startPreviewStream { [weak self] text in
-            Task { @MainActor in
-                self?.handlePreviewTranscript(text)
-            }
-        }
+        )
         recordingElapsedSeconds = 0
         recordingTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.recordingElapsedSeconds += 1 }
@@ -464,20 +716,38 @@ final class AppState: ObservableObject {
         recordingTimer = nil
         transcript = ""
         previewActive = false
-        asrService.finishPreviewStream()
+        cancelPreviewOverlayRefresh()
         phase = .transcribing(nil)
         onOverlayRequest?(true)
 
+        defer {
+            finishPreviewAudioStreamIfNeeded()
+        }
         let url = try await recorder.stop()
         currentRecordingURL = url
     }
 
     func cancel() {
+        if case .idle = phase, historyOpen {
+            closeHistory()
+            return
+        }
+
         let targetApp = previousApp
         recordingTimer?.invalidate()
         recordingTimer = nil
         previewActive = false
+        previewStreamActive = false
+        previewAudioGate.setEnabled(false)
         previewTranscript = ""
+        measuredPreviewTextSize = CGSize(width: 0, height: 18)
+        overlayPreviewTextViewportHeight = 18
+        islandPinnedOpen = false
+        islandHovering = false
+        historyOpen = false
+        cancelRecordingHoverCollapse()
+        cancelPreviewOverlayRefresh()
+        cancelPreviewStreamShutdown()
         recorder.cancel()
         asrService.cancelCurrentProcess()
         if let currentRecordingURL {
@@ -487,7 +757,7 @@ final class AppState: ObservableObject {
         transcript = ""
         previousApp = nil
         phase = .idle
-        onOverlayRequest?(false)
+        onOverlayRequest?(shouldShowIdleIsland)
         if let targetApp {
             targetApp.activate()
         }
@@ -500,7 +770,7 @@ final class AppState: ObservableObject {
 
     func hidePermissions() {
         phase = .idle
-        onOverlayRequest?(false)
+        onOverlayRequest?(shouldShowIdleIsland)
     }
 
     func showMissingColi() {
@@ -525,7 +795,7 @@ final class AppState: ObservableObject {
                 // Verify installation
                 if ColiASRService.isInstalled {
                     phase = .idle
-                    onOverlayRequest?(false)
+                    onOverlayRequest?(shouldShowIdleIsland)
                 } else {
                     // Fallback to manual guidance
                     phase = .missingColi
@@ -539,7 +809,7 @@ final class AppState: ObservableObject {
     func hideColiGuidance() {
         if case .missingColi = phase {
             phase = .idle
-            onOverlayRequest?(false)
+            onOverlayRequest?(shouldShowIdleIsland)
         }
     }
 
@@ -568,6 +838,7 @@ final class AppState: ObservableObject {
 
             // Show result briefly, then auto-insert
             phase = .done(transcript)
+            recordHistory(transcript)
             onOverlayRequest?(true)
             confirmInsert()
         } catch is CancellationError {
@@ -615,29 +886,36 @@ final class AppState: ObservableObject {
 
     private func resetState() {
         previewActive = false
+        previewStreamActive = false
+        previewAudioGate.setEnabled(false)
         previewTranscript = ""
+        measuredPreviewTextSize = CGSize(width: 0, height: 18)
+        overlayPreviewTextViewportHeight = 18
         if let currentRecordingURL {
             try? FileManager.default.removeItem(at: currentRecordingURL)
         }
         currentRecordingURL = nil
         previousApp = nil
         transcript = ""
+        islandPinnedOpen = false
+        islandHovering = false
+        historyOpen = false
+        cancelRecordingHoverCollapse()
+        cancelPreviewOverlayRefresh()
+        cancelPreviewStreamShutdown()
         phase = .idle
-        onOverlayRequest?(false)
-    }
-
-    private func handlePreviewAudioPayload(_ payload: PreviewStreamPayload) {
-        guard previewActive else { return }
-        asrService.sendPreviewAudio(payload.data, isFinal: payload.isFinal)
+        onOverlayRequest?(shouldShowIdleIsland)
     }
 
     private func handlePreviewTranscript(_ text: String) {
         guard previewActive else { return }
         let normalized = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard normalized.isEmpty == false else { return }
+        guard normalized != previewTranscript else { return }
+        measuredPreviewTextSize = CGSize(width: 0, height: 18)
         previewTranscript = normalized
         if case .recording = phase {
-            onOverlayRequest?(true)
+            schedulePreviewOverlayRefresh()
         }
     }
 
@@ -658,6 +936,7 @@ final class AppState: ObservableObject {
             }
 
             phase = .done(transcript)
+            recordHistory(transcript)
             onOverlayRequest?(true)
             // Copy to clipboard (don't paste into another app)
             NSPasteboard.general.clearContents()
@@ -671,6 +950,390 @@ final class AppState: ObservableObject {
         } catch {
             showError(error.localizedDescription)
         }
+    }
+
+    var shouldShowIdleIsland: Bool {
+        !transcriptHistory.items.isEmpty && !suppressIdleIslandForFullscreenApp
+    }
+
+    var isRecordingIslandExpanded: Bool {
+        islandHovering || islandPinnedOpen
+    }
+
+    var isCollapsedHistoryEntry: Bool {
+        if case .idle = phase {
+            return shouldShowIdleIsland && !historyOpen
+        }
+        return false
+    }
+
+    @discardableResult
+    func updateIslandLayout(for screen: ScreenGeometry) -> OverlayLayoutPlan? {
+        if let request = overlayLayoutRequest(for: screen) {
+            let plan = OverlayLayoutPlanner.makePlan(request)
+            applyOverlayLayoutPlan(plan)
+            return plan
+        }
+
+        let nextIslandWidth = CompactIslandMetrics.width(for: screen)
+        let nextCollapsedRailWidth = CompactIslandMetrics.collapsedRecordingWidth(for: screen)
+        let nextCollapsedSpacerWidth = CompactIslandMetrics.collapsedRecordingSpacerWidth(for: screen)
+        let nextNotchAttachmentHeight = OverlayGeometry.notchAttachmentHeight(for: screen)
+        let nextHistoryPanelWidth = CompactIslandMetrics.historyPanelWidth(
+            forTextLengths: transcriptHistory.items.map { $0.text.count },
+            screen: screen
+        )
+        let previewText = previewTranscript.isEmpty ? phase.subtitle : previewTranscript
+        let nextPreviewPanelWidth = CompactIslandMetrics.previewPanelWidth(
+            forTextLength: previewText.count,
+            screen: screen
+        )
+
+        if islandWidth != nextIslandWidth {
+            islandWidth = nextIslandWidth
+        }
+        if collapsedRecordingRailWidth != nextCollapsedRailWidth {
+            collapsedRecordingRailWidth = nextCollapsedRailWidth
+        }
+        if collapsedRecordingSpacerWidth != nextCollapsedSpacerWidth {
+            collapsedRecordingSpacerWidth = nextCollapsedSpacerWidth
+        }
+        if historyPanelWidth != nextHistoryPanelWidth {
+            historyPanelWidth = nextHistoryPanelWidth
+        }
+        if previewPanelWidth != nextPreviewPanelWidth {
+            previewPanelWidth = nextPreviewPanelWidth
+        }
+        if notchAttachmentHeight != nextNotchAttachmentHeight {
+            notchAttachmentHeight = nextNotchAttachmentHeight
+        }
+        overlayLayoutPlan = nil
+        return nil
+    }
+
+    private func overlayLayoutRequest(for screen: ScreenGeometry) -> OverlayLayoutRequest? {
+        let measurements = OverlayMeasurements(
+            previewTextSize: measuredPreviewTextSize.height > 18.5 ? measuredPreviewTextSize : nil,
+            historyRowSizes: transcriptHistory.items.map { item in
+                measuredHistoryRowSizes[item.id] ?? .zero
+            }
+        )
+
+        if case .recording = phase {
+            return OverlayLayoutRequest(
+                screen: screen,
+                scene: .recording(
+                    RecordingOverlayScene(
+                        isExpanded: isRecordingIslandExpanded,
+                        previewText: previewTranscript,
+                        elapsedText: recordingElapsedStr
+                    )
+                ),
+                measurements: measurements,
+                previousPlan: overlayLayoutPlan
+            )
+        }
+
+        if case .idle = phase, shouldShowIdleIsland {
+            return OverlayLayoutRequest(
+                screen: screen,
+                scene: .history(
+                    HistoryOverlayScene(
+                        isExpanded: historyOpen,
+                        items: transcriptHistory.items
+                    )
+                ),
+                measurements: measurements,
+                previousPlan: overlayLayoutPlan
+            )
+        }
+
+        return nil
+    }
+
+    private func applyOverlayLayoutPlan(_ plan: OverlayLayoutPlan) {
+        if islandWidth != plan.islandWidth {
+            islandWidth = plan.islandWidth
+        }
+        if collapsedRecordingRailWidth != plan.collapsedRailWidth {
+            collapsedRecordingRailWidth = plan.collapsedRailWidth
+        }
+        if collapsedRecordingSpacerWidth != plan.collapsedSpacerWidth {
+            collapsedRecordingSpacerWidth = plan.collapsedSpacerWidth
+        }
+        if notchAttachmentHeight != plan.attachmentHeight {
+            notchAttachmentHeight = plan.attachmentHeight
+        }
+
+        switch plan.variant {
+        case .recordingPreview:
+            if previewPanelWidth != plan.panelFrame.width {
+                previewPanelWidth = plan.panelFrame.width
+            }
+            if let viewportHeight = plan.viewportHeight,
+               overlayPreviewTextViewportHeight != viewportHeight {
+                overlayPreviewTextViewportHeight = viewportHeight
+            }
+        case .singleHistory, .historyList:
+            if historyPanelWidth != plan.panelFrame.width {
+                historyPanelWidth = plan.panelFrame.width
+            }
+            if let viewportHeight = plan.viewportHeight,
+               overlayHistoryRowsViewportHeight != viewportHeight {
+                overlayHistoryRowsViewportHeight = viewportHeight
+            }
+        case .recordingRail, .historyEntry:
+            break
+        }
+
+        overlayLayoutPlan = plan
+    }
+
+    func updateMeasuredPreviewTextSize(_ size: CGSize) {
+        let normalized = CGSize(
+            width: max(0, size.width.rounded(.up)),
+            height: max(18, size.height.rounded(.up))
+        )
+        guard abs(measuredPreviewTextSize.width - normalized.width) > 0.5
+            || abs(measuredPreviewTextSize.height - normalized.height) > 0.5 else {
+            return
+        }
+
+        measuredPreviewTextSize = normalized
+        if case .recording = phase, isRecordingIslandExpanded {
+            schedulePreviewOverlayRefresh()
+        }
+    }
+
+    func updateMeasuredHistoryRowSizes(_ sizes: [UUID: CGSize]) {
+        guard !sizes.isEmpty else { return }
+
+        var nextSizes = measuredHistoryRowSizes
+        for (id, size) in sizes {
+            nextSizes[id] = CGSize(
+                width: max(0, size.width.rounded(.up)),
+                height: max(22, size.height.rounded(.up))
+            )
+        }
+        guard nextSizes != measuredHistoryRowSizes else { return }
+
+        measuredHistoryRowSizes = nextSizes
+        if case .idle = phase, historyOpen {
+            onOverlayRequest?(true)
+        }
+    }
+
+    func updateTopOverlayHost(
+        active: Bool,
+        hostWidth: CGFloat = 0,
+        hostHeight: CGFloat = 0,
+        contentFrame: CGRect = .zero
+    ) {
+        guard active else {
+            if usesTopOverlayHost {
+                usesTopOverlayHost = false
+            }
+            overlayLayoutPlan = nil
+            return
+        }
+
+        if overlayHostWidth != hostWidth {
+            overlayHostWidth = hostWidth
+        }
+        if overlayHostHeight != hostHeight {
+            overlayHostHeight = hostHeight
+        }
+        if overlayContentX != contentFrame.minX {
+            overlayContentX = contentFrame.minX
+        }
+        if overlayContentY != contentFrame.minY {
+            overlayContentY = contentFrame.minY
+        }
+        if overlayContentWidth != contentFrame.width {
+            overlayContentWidth = contentFrame.width
+        }
+        if overlayContentHeight != contentFrame.height {
+            overlayContentHeight = contentFrame.height
+        }
+        if usesTopOverlayHost != true {
+            usesTopOverlayHost = true
+        }
+    }
+
+    func setIslandHovering(_ hovering: Bool) {
+        guard case .recording = phase else { return }
+
+        if hovering {
+            cancelRecordingHoverCollapse()
+            guard !islandHovering else { return }
+            islandHovering = true
+            enablePreviewAudioStreamIfNeeded()
+            onOverlayRequest?(true)
+            return
+        }
+
+        scheduleRecordingHoverCollapse()
+    }
+
+    private func scheduleRecordingHoverCollapse() {
+        cancelRecordingHoverCollapse()
+
+        let workItem = DispatchWorkItem { [weak self] in
+            Task { @MainActor in
+                self?.collapseRecordingHoverIfNeeded()
+            }
+        }
+        hoverCollapseWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.16, execute: workItem)
+    }
+
+    private func collapseRecordingHoverIfNeeded() {
+        if case .recording = phase {
+            guard islandHovering, !islandPinnedOpen else { return }
+            if onRecordingIslandHoverRegionCheck?() == true {
+                scheduleRecordingHoverCollapse()
+                return
+            }
+
+            islandHovering = false
+            schedulePreviewAudioStreamPauseIfNeeded()
+            onOverlayRequest?(true)
+        }
+    }
+
+    private func cancelRecordingHoverCollapse() {
+        hoverCollapseWorkItem?.cancel()
+        hoverCollapseWorkItem = nil
+    }
+
+    func toggleRecordingIsland() {
+        guard case .recording = phase else { return }
+        cancelRecordingHoverCollapse()
+        islandPinnedOpen.toggle()
+        if isRecordingIslandExpanded {
+            enablePreviewAudioStreamIfNeeded()
+        } else {
+            schedulePreviewAudioStreamPauseIfNeeded()
+        }
+        onOverlayRequest?(true)
+    }
+
+    private func enablePreviewAudioStreamIfNeeded() {
+        guard previewActive else { return }
+        cancelPreviewStreamShutdown()
+
+        if !previewStreamActive {
+            let didStart = asrService.startPreviewStream { [weak self] text in
+                Task { @MainActor in
+                    self?.handlePreviewTranscript(text)
+                }
+            }
+            previewStreamActive = didStart
+        }
+
+        if previewStreamActive {
+            recorder.setPreviewStreamingEnabled(true)
+            previewAudioGate.setEnabled(true)
+        }
+    }
+
+    private func schedulePreviewAudioStreamPauseIfNeeded() {
+        guard previewStreamActive, !isRecordingIslandExpanded else { return }
+        cancelPreviewStreamShutdown()
+
+        let workItem = DispatchWorkItem { [weak self] in
+            Task { @MainActor in
+                self?.finishPreviewAudioStreamIfNeeded()
+            }
+        }
+        previewStreamShutdownWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + previewStreamIdleShutdownDelay, execute: workItem)
+    }
+
+    private func finishPreviewAudioStreamIfNeeded() {
+        cancelPreviewStreamShutdown()
+        previewAudioGate.setEnabled(false)
+        recorder.setPreviewStreamingEnabled(false)
+        guard previewStreamActive else { return }
+        previewStreamActive = false
+        asrService.finishPreviewStream()
+    }
+
+    private func cancelPreviewStreamShutdown() {
+        previewStreamShutdownWorkItem?.cancel()
+        previewStreamShutdownWorkItem = nil
+    }
+
+    func setIdleIslandSuppressedForFullscreen(_ suppressed: Bool) {
+        guard suppressIdleIslandForFullscreenApp != suppressed else { return }
+
+        suppressIdleIslandForFullscreenApp = suppressed
+        guard case .idle = phase else { return }
+
+        if suppressed {
+            historyOpen = false
+            onOverlayRequest?(false)
+        } else {
+            onOverlayRequest?(shouldShowIdleIsland)
+        }
+    }
+
+    func openHistory() {
+        guard shouldShowIdleIsland, !historyOpen else { return }
+        historyOpen = true
+        onOverlayRequest?(true)
+    }
+
+    func closeHistory() {
+        guard historyOpen else { return }
+        historyOpen = false
+        onOverlayRequest?(shouldShowIdleIsland)
+    }
+
+    func copyHistoryItem(_ item: TranscriptHistoryItem) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(item.text, forType: .string)
+    }
+
+    private func recordHistory(_ text: String) {
+        transcriptHistory.record(text)
+    }
+
+    private func schedulePreviewOverlayRefresh() {
+        guard case .recording = phase else { return }
+
+        let now = CACurrentMediaTime()
+        let remainingDelay = previewOverlayRefreshInterval - (now - lastPreviewOverlayRefreshAt)
+        previewOverlayRefreshWorkItem?.cancel()
+
+        guard remainingDelay > 0 else {
+            performPreviewOverlayRefresh()
+            return
+        }
+
+        let workItem = DispatchWorkItem { [weak self] in
+            Task { @MainActor in
+                self?.performPreviewOverlayRefresh()
+            }
+        }
+        previewOverlayRefreshWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + remainingDelay, execute: workItem)
+    }
+
+    private func performPreviewOverlayRefresh() {
+        guard case .recording = phase else {
+            cancelPreviewOverlayRefresh()
+            return
+        }
+
+        previewOverlayRefreshWorkItem = nil
+        lastPreviewOverlayRefreshAt = CACurrentMediaTime()
+        onOverlayRequest?(true)
+    }
+
+    private func cancelPreviewOverlayRefresh() {
+        previewOverlayRefreshWorkItem?.cancel()
+        previewOverlayRefreshWorkItem = nil
     }
 }
 
@@ -810,24 +1473,32 @@ final class AudioRecorder: NSObject, AVCaptureFileOutputRecordingDelegate, AVCap
         let output: AVCaptureAudioFileOutput
         let dataOutput: AVCaptureAudioDataOutput
         let recordingURL: URL
+        let shouldStreamPreviewAudio: @Sendable () -> Bool
         let streamHandler: @Sendable (PreviewStreamPayload) -> Void
         let audioDataQueue = DispatchQueue(label: "ai.marswave.typeno.recorder.audio-data")
         var stopContinuation: CheckedContinuation<URL, Error>?
         var discardRecordingOnFinish = false
         var converter: AVAudioConverter?
         var sourceBuffer: AVAudioPCMBuffer?
+        var previewPCMBuffer = Data()
+        var previewBufferedFrameCount = 0
+        var previewStreamClosed = false
+        var previewOutputAttached = false
+        let previewFlushFrameThreshold = 1_600
 
         init(
             session: AVCaptureSession,
             output: AVCaptureAudioFileOutput,
             dataOutput: AVCaptureAudioDataOutput,
             recordingURL: URL,
+            shouldStreamPreviewAudio: @escaping @Sendable () -> Bool,
             streamHandler: @escaping @Sendable (PreviewStreamPayload) -> Void
         ) {
             self.session = session
             self.output = output
             self.dataOutput = dataOutput
             self.recordingURL = recordingURL
+            self.shouldStreamPreviewAudio = shouldStreamPreviewAudio
             self.streamHandler = streamHandler
         }
     }
@@ -838,7 +1509,11 @@ final class AudioRecorder: NSObject, AVCaptureFileOutputRecordingDelegate, AVCap
     private let audioContextLock = NSLock()
     private nonisolated(unsafe) var audioDataContexts: [ObjectIdentifier: RecordingContext] = [:]
 
-    func start(using microphone: AVCaptureDevice, streamHandler: @escaping @Sendable (PreviewStreamPayload) -> Void) throws -> URL {
+    func start(
+        using microphone: AVCaptureDevice,
+        shouldStreamPreviewAudio: @escaping @Sendable () -> Bool,
+        streamHandler: @escaping @Sendable (PreviewStreamPayload) -> Void
+    ) throws -> URL {
         guard currentRecordingID == nil else {
             throw TypeNoError.couldNotStartRecording
         }
@@ -866,6 +1541,9 @@ final class AudioRecorder: NSObject, AVCaptureFileOutputRecordingDelegate, AVCap
             }
             session.addOutput(output)
 
+            // Keep the preview audio output wired into the session from the start.
+            // Dynamically adding/removing outputs while AVCaptureAudioFileOutput is recording
+            // is unreliable on some machines, but leaving the delegate nil keeps it cold.
             guard session.canAddOutput(dataOutput) else {
                 throw TypeNoError.couldNotStartRecording
             }
@@ -877,6 +1555,7 @@ final class AudioRecorder: NSObject, AVCaptureFileOutputRecordingDelegate, AVCap
             output: output,
             dataOutput: dataOutput,
             recordingURL: url,
+            shouldStreamPreviewAudio: shouldStreamPreviewAudio,
             streamHandler: streamHandler
         )
         dataOutput.audioSettings = [
@@ -886,20 +1565,27 @@ final class AudioRecorder: NSObject, AVCaptureFileOutputRecordingDelegate, AVCap
             AVLinearPCMIsNonInterleaved: false,
             AVLinearPCMIsBigEndianKey: false
         ]
-        dataOutput.setSampleBufferDelegate(self, queue: context.audioDataQueue)
 
         let contextID = ObjectIdentifier(output)
         activeContexts[contextID] = context
         currentRecordingID = contextID
 
-        let dataOutputID = ObjectIdentifier(dataOutput)
-        audioContextLock.lock()
-        audioDataContexts[dataOutputID] = context
-        audioContextLock.unlock()
-
         session.startRunning()
         output.startRecording(to: url, outputFileType: .m4a, recordingDelegate: self)
         return url
+    }
+
+    func setPreviewStreamingEnabled(_ enabled: Bool) {
+        guard let contextID = currentRecordingID,
+              let context = activeContexts[contextID] else {
+            return
+        }
+
+        if enabled {
+            attachPreviewOutput(to: context)
+        } else {
+            detachPreviewOutput(from: context, flushPendingAudio: true)
+        }
     }
 
     func stop() async throws -> URL {
@@ -914,7 +1600,9 @@ final class AudioRecorder: NSObject, AVCaptureFileOutputRecordingDelegate, AVCap
             return context.recordingURL
         }
 
-        context.streamHandler(PreviewStreamPayload(data: Data(), isFinal: true))
+        context.audioDataQueue.sync {
+            Self.flushPreviewPCMBuffer(for: context, isFinal: true)
+        }
 
         return try await withCheckedThrowingContinuation { continuation in
             context.stopContinuation = continuation
@@ -933,7 +1621,9 @@ final class AudioRecorder: NSObject, AVCaptureFileOutputRecordingDelegate, AVCap
 
         let wasRecording = context.output.isRecording
         context.discardRecordingOnFinish = true
-        context.streamHandler(PreviewStreamPayload(data: Data(), isFinal: true))
+        context.audioDataQueue.sync {
+            Self.flushPreviewPCMBuffer(for: context, isFinal: true)
+        }
         context.output.stopRecording()
         if !wasRecording {
             tearDownCapturePipeline(for: context)
@@ -976,21 +1666,58 @@ final class AudioRecorder: NSObject, AVCaptureFileOutputRecordingDelegate, AVCap
             return
         }
         guard let context else { return }
+        guard context.shouldStreamPreviewAudio() else { return }
         guard let data = Self.makePreviewPCMData(from: sampleBuffer, context: context) else { return }
-        context.streamHandler(PreviewStreamPayload(data: data, isFinal: false))
+        Self.appendPreviewPCMData(data, to: context)
     }
 
     private func tearDownCapturePipeline(for context: RecordingContext) {
+        detachPreviewOutput(from: context, flushPendingAudio: false)
+        context.audioDataQueue.sync {
+            Self.flushPreviewPCMBuffer(for: context, isFinal: false)
+        }
+        context.dataOutput.setSampleBufferDelegate(nil, queue: nil)
+        if context.session.outputs.contains(where: { $0 === context.dataOutput }) {
+            context.session.removeOutput(context.dataOutput)
+        }
+        if context.session.outputs.contains(where: { $0 === context.output }) {
+            context.session.removeOutput(context.output)
+        }
+        context.session.inputs.forEach { context.session.removeInput($0) }
+        if context.session.isRunning {
+            context.session.stopRunning()
+        }
+    }
+
+    private func attachPreviewOutput(to context: RecordingContext) {
+        guard !context.previewOutputAttached,
+              !context.previewStreamClosed else {
+            return
+        }
+
+        context.dataOutput.setSampleBufferDelegate(self, queue: context.audioDataQueue)
+        let dataOutputID = ObjectIdentifier(context.dataOutput)
+        audioContextLock.lock()
+        audioDataContexts[dataOutputID] = context
+        audioContextLock.unlock()
+        context.previewOutputAttached = true
+    }
+
+    private func detachPreviewOutput(from context: RecordingContext, flushPendingAudio: Bool) {
+        guard context.previewOutputAttached else { return }
+
+        if flushPendingAudio {
+            context.audioDataQueue.sync {
+                Self.flushPreviewPCMBuffer(for: context, isFinal: false)
+            }
+        }
+
         let dataOutputID = ObjectIdentifier(context.dataOutput)
         audioContextLock.lock()
         audioDataContexts.removeValue(forKey: dataOutputID)
         audioContextLock.unlock()
         context.dataOutput.setSampleBufferDelegate(nil, queue: nil)
-        if context.session.isRunning {
-            context.session.stopRunning()
-        }
-        context.session.inputs.forEach { context.session.removeInput($0) }
-        context.session.outputs.forEach { context.session.removeOutput($0) }
+        context.previewOutputAttached = false
     }
 
     private func finishStop(for contextID: ObjectIdentifier, with result: Result<URL, Error>) {
@@ -1062,6 +1789,32 @@ final class AudioRecorder: NSObject, AVCaptureFileOutputRecordingDelegate, AVCap
 
         return Data(bytes: audioData, count: byteCount)
     }
+
+    private nonisolated static func appendPreviewPCMData(_ data: Data, to context: RecordingContext) {
+        guard !context.previewStreamClosed else { return }
+        context.previewPCMBuffer.append(data)
+        context.previewBufferedFrameCount += data.count / 2
+
+        if context.previewBufferedFrameCount >= context.previewFlushFrameThreshold {
+            flushPreviewPCMBuffer(for: context, isFinal: false)
+        }
+    }
+
+    private nonisolated static func flushPreviewPCMBuffer(for context: RecordingContext, isFinal: Bool) {
+        guard !context.previewStreamClosed else { return }
+
+        if !context.previewPCMBuffer.isEmpty {
+            let payload = context.previewPCMBuffer
+            context.previewPCMBuffer.removeAll(keepingCapacity: true)
+            context.previewBufferedFrameCount = 0
+            context.streamHandler(PreviewStreamPayload(data: payload, isFinal: false))
+        }
+
+        if isFinal {
+            context.previewStreamClosed = true
+            context.streamHandler(PreviewStreamPayload(data: Data(), isFinal: true))
+        }
+    }
 }
 
 // MARK: - ASR Service
@@ -1075,8 +1828,11 @@ private final class LockedData: @unchecked Sendable {
 }
 
 final class ColiASRService: @unchecked Sendable {
+    private static let previewCapabilityLock = NSLock()
+    nonisolated(unsafe) private static var previewCapabilityCache: (path: String, supported: Bool)?
+
     static var isInstalled: Bool {
-        findColiPath() != nil
+        findPreviewCapableColiPath() != nil
     }
 
     static var isNpmAvailable: Bool {
@@ -1165,6 +1921,7 @@ final class ColiASRService: @unchecked Sendable {
 
     private var currentProcess: Process?
     private let processLock = NSLock()
+    private let previewWriteQueue = DispatchQueue(label: "ai.marswave.typeno.asr.preview-write", qos: .utility)
     private var currentProcessWasCancelled = false
     private var previewState: PreviewState?
 
@@ -1189,15 +1946,28 @@ final class ColiASRService: @unchecked Sendable {
         }
     }
 
-    func startPreviewStream(onPreviewText: @MainActor @escaping @Sendable (String) -> Void) {
+    @discardableResult
+    func startPreviewStream(onPreviewText: @MainActor @escaping @Sendable (String) -> Void) -> Bool {
+        previewWriteQueue.sync {}
+
         processLock.lock()
-        defer { processLock.unlock() }
-        guard previewState == nil else { return }
-        guard let coliPath = Self.findColiPath() else { return }
+        guard previewState == nil else {
+            processLock.unlock()
+            return true
+        }
+        guard let coliPath = Self.findPreviewCapableColiPath() else {
+            processLock.unlock()
+            return false
+        }
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: coliPath)
-        process.arguments = ["asr-stream", "--json", "--asr-interval-ms", "1000"]
+        process.arguments = [
+            "asr-stream",
+            "--json",
+            "--asr-interval-ms",
+            "\(Self.previewASRIntervalMilliseconds())"
+        ]
         process.environment = Self.makeColiEnvironment(coliPath: coliPath)
 
         let stdin = Pipe()
@@ -1222,13 +1992,25 @@ final class ColiASRService: @unchecked Sendable {
         do {
             try process.run()
             previewState = PreviewState(process: process, stdin: stdin.fileHandleForWriting)
+            processLock.unlock()
+            return true
         } catch {
             stdoutHandle.readabilityHandler = nil
             stderrHandle.readabilityHandler = nil
+            processLock.unlock()
+            return false
         }
     }
 
     func sendPreviewAudio(_ data: Data, isFinal: Bool) {
+        guard isFinal || data.isEmpty == false else { return }
+
+        previewWriteQueue.async { [weak self] in
+            self?.writePreviewAudio(data, isFinal: isFinal)
+        }
+    }
+
+    private func writePreviewAudio(_ data: Data, isFinal: Bool) {
         processLock.lock()
         guard let state = previewState else {
             processLock.unlock()
@@ -1247,6 +2029,12 @@ final class ColiASRService: @unchecked Sendable {
     }
 
     func finishPreviewStream() {
+        previewWriteQueue.async { [weak self] in
+            self?.closePreviewStreamAfterQueuedWrites()
+        }
+    }
+
+    private func closePreviewStreamAfterQueuedWrites() {
         processLock.lock()
         guard let state = previewState else {
             processLock.unlock()
@@ -1504,6 +2292,12 @@ final class ColiASRService: @unchecked Sendable {
         return env
     }
 
+    private static func previewASRIntervalMilliseconds() -> Int {
+        let value = ProcessInfo.processInfo.environment["TYPENO_PREVIEW_ASR_INTERVAL_MS"]
+            .flatMap(Int.init) ?? 2_000
+        return min(max(value, 1_000), 5_000)
+    }
+
     private static func detectIncompleteModelDownload() -> String? {
         let home = FileManager.default.homeDirectoryForCurrentUser
         let modelsDir = home.appendingPathComponent(".coli/models", isDirectory: true)
@@ -1634,6 +2428,66 @@ final class ColiASRService: @unchecked Sendable {
 
         // GUI apps don't inherit terminal PATH, so spawn a login shell to resolve coli
         return resolveViaShell("coli")
+    }
+
+    private static func findPreviewCapableColiPath() -> String? {
+        guard let coliPath = findColiPath() else {
+            return nil
+        }
+
+        previewCapabilityLock.lock()
+        if let cache = previewCapabilityCache, cache.path == coliPath {
+            previewCapabilityLock.unlock()
+            return cache.supported ? coliPath : nil
+        }
+        previewCapabilityLock.unlock()
+
+        let supported = supportsPreviewStream(coliPath: coliPath)
+
+        previewCapabilityLock.lock()
+        previewCapabilityCache = (path: coliPath, supported: supported)
+        previewCapabilityLock.unlock()
+
+        guard supported else { return nil }
+        return coliPath
+    }
+
+    private static func supportsPreviewStream(coliPath: String) -> Bool {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: coliPath)
+        process.arguments = ["asr-stream", "--help"]
+        process.environment = makeColiEnvironment(coliPath: coliPath)
+
+        let stdout = Pipe()
+        let stderr = Pipe()
+        process.standardOutput = stdout
+        process.standardError = stderr
+
+        do {
+            try process.run()
+
+            let timeoutItem = DispatchWorkItem {
+                if process.isRunning { process.terminate() }
+            }
+            DispatchQueue.global().asyncAfter(deadline: .now() + 3, execute: timeoutItem)
+
+            process.waitUntilExit()
+            timeoutItem.cancel()
+
+            let outputData = stdout.fileHandleForReading.readDataToEndOfFile()
+            let errorData = stderr.fileHandleForReading.readDataToEndOfFile()
+            let output = [
+                String(data: outputData, encoding: .utf8),
+                String(data: errorData, encoding: .utf8)
+            ]
+                .compactMap { $0 }
+                .joined(separator: "\n")
+                .lowercased()
+
+            return process.terminationStatus == 0 && output.contains("asr-stream")
+        } catch {
+            return false
+        }
     }
 
     private static func executableInPath(named name: String, path: String?) -> String? {
@@ -2142,17 +2996,115 @@ final class EscapeAwarePanel: NSPanel {
 }
 
 @MainActor
+final class OverlayHitTestView: NSView {
+    private weak var appState: AppState?
+
+    init(appState: AppState) {
+        self.appState = appState
+        super.init(frame: .zero)
+    }
+
+    required init?(coder: NSCoder) {
+        nil
+    }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
+        true
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard let appState, appState.usesTopOverlayHost else {
+            return super.hitTest(point)
+        }
+
+        let baseHitRegions = appState.overlayLayoutPlan?.hitRegions ?? [
+            CGRect(
+                x: appState.overlayContentX,
+                y: appState.overlayContentY,
+                width: appState.overlayContentWidth,
+                height: appState.overlayContentHeight
+            ).insetBy(dx: -8, dy: -8)
+        ]
+        let hitRegions: [CGRect]
+        if appState.isCollapsedHistoryEntry {
+            hitRegions = baseHitRegions.map { $0.insetBy(dx: -18, dy: -10) }
+        } else {
+            hitRegions = baseHitRegions
+        }
+        let containsPoint = hitRegions.contains { region in
+            let activeRect = NSRect(
+                x: region.minX,
+                y: bounds.height - region.minY - region.height,
+                width: region.width,
+                height: region.height
+            )
+            return activeRect.contains(point)
+        }
+
+        guard containsPoint else { return nil }
+        if appState.isCollapsedHistoryEntry {
+            return self
+        }
+        return super.hitTest(point)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        guard let appState, appState.isCollapsedHistoryEntry else {
+            super.mouseDown(with: event)
+            return
+        }
+
+        appState.openHistory()
+    }
+
+    private func minimumInteractiveHeight(for appState: AppState) -> CGFloat {
+        guard appState.historyOpen else { return 0 }
+
+        let textLengths = appState.transcriptHistory.items.map { $0.text.count }
+        let estimatedRowsHeight = CompactIslandMetrics.historyRowsViewportHeight(
+            forTextLengths: textLengths,
+            panelWidth: appState.historyPanelWidth
+        )
+        if textLengths.count == 1 {
+            return appState.notchAttachmentHeight + 16 + max(30, estimatedRowsHeight)
+        }
+
+        return appState.notchAttachmentHeight + 20 + 18 + 6 + estimatedRowsHeight
+    }
+}
+
+@MainActor
+private final class FirstMouseHostingView<Content: View>: NSHostingView<Content> {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
+        true
+    }
+}
+
+@MainActor
 final class OverlayPanelController {
     private let hudPanel: NSPanel
     private let capturePanel: EscapeAwarePanel
     private let hudHostingView: NSHostingView<OverlayView>
     private let captureHostingView: NSHostingView<OverlayView>
+    private let measuringHostingView: NSHostingView<OverlayView>
+    private let hudHitTestView: OverlayHitTestView
+    private let captureHitTestView: OverlayHitTestView
     private let appState: AppState
+    private let islandFrameAnimationDuration: TimeInterval = 0.24
+    private let recordingHoverMouseCheckInterval: CFTimeInterval = 1.0 / 60.0
+    private var globalMouseMoveMonitor: Any?
+    private var localMouseMoveMonitor: Any?
+    private var globalHistoryClickMonitor: Any?
+    private var localHistoryClickMonitor: Any?
+    private var lastRecordingHoverMouseCheckAt: CFTimeInterval = 0
 
     init(appState: AppState) {
         self.appState = appState
-        hudHostingView = NSHostingView(rootView: OverlayView(appState: appState))
-        captureHostingView = NSHostingView(rootView: OverlayView(appState: appState))
+        hudHostingView = FirstMouseHostingView(rootView: OverlayView(appState: appState))
+        captureHostingView = FirstMouseHostingView(rootView: OverlayView(appState: appState))
+        measuringHostingView = FirstMouseHostingView(rootView: OverlayView(appState: appState, forceContentOnly: true))
+        hudHitTestView = OverlayHitTestView(appState: appState)
+        captureHitTestView = OverlayHitTestView(appState: appState)
 
         hudPanel = NSPanel(
             contentRect: NSRect(x: 0, y: 0, width: 400, height: 300),
@@ -2167,8 +3119,10 @@ final class OverlayPanelController {
             defer: false
         )
 
-        configure(panel: hudPanel, contentView: hudHostingView)
-        configure(panel: capturePanel, contentView: captureHostingView)
+        configure(panel: hudPanel, contentView: hudHitTestView)
+        configure(panel: capturePanel, contentView: captureHitTestView)
+        install(hostingView: hudHostingView, in: hudHitTestView)
+        install(hostingView: captureHostingView, in: captureHitTestView)
         capturePanel.onEscape = { [weak appState] in
             appState?.onCancel?()
         }
@@ -2177,18 +3131,224 @@ final class OverlayPanelController {
         }
     }
 
+    deinit {
+        MainActor.assumeIsolated {
+            removeMouseTrackingMonitors()
+            removeHistoryClickMonitors()
+        }
+    }
+
+    private func install(hostingView: NSView, in containerView: NSView) {
+        containerView.addSubview(hostingView)
+        hostingView.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            hostingView.topAnchor.constraint(equalTo: containerView.topAnchor),
+            hostingView.bottomAnchor.constraint(equalTo: containerView.bottomAnchor),
+            hostingView.leadingAnchor.constraint(equalTo: containerView.leadingAnchor),
+            hostingView.trailingAnchor.constraint(equalTo: containerView.trailingAnchor)
+        ])
+    }
+
+    private func installMouseTrackingMonitors() {
+        guard globalMouseMoveMonitor == nil, localMouseMoveMonitor == nil else { return }
+
+        let eventMask: NSEvent.EventTypeMask = [
+            .mouseMoved,
+            .leftMouseDragged,
+            .rightMouseDragged,
+            .otherMouseDragged
+        ]
+        globalMouseMoveMonitor = NSEvent.addGlobalMonitorForEvents(matching: eventMask) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.updateRecordingHoverFromMouseLocation()
+            }
+        }
+        localMouseMoveMonitor = NSEvent.addLocalMonitorForEvents(matching: eventMask) { [weak self] event in
+            Task { @MainActor [weak self] in
+                self?.updateRecordingHoverFromMouseLocation()
+            }
+            return event
+        }
+    }
+
+    private func removeMouseTrackingMonitors() {
+        if let globalMouseMoveMonitor {
+            NSEvent.removeMonitor(globalMouseMoveMonitor)
+            self.globalMouseMoveMonitor = nil
+        }
+        if let localMouseMoveMonitor {
+            NSEvent.removeMonitor(localMouseMoveMonitor)
+            self.localMouseMoveMonitor = nil
+        }
+        lastRecordingHoverMouseCheckAt = 0
+    }
+
+    private func installHistoryClickMonitors() {
+        guard globalHistoryClickMonitor == nil, localHistoryClickMonitor == nil else { return }
+
+        globalHistoryClickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown]) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.openHistoryIfMouseIsInsideCollapsedEntry()
+            }
+        }
+        localHistoryClickMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown]) { [weak self] event in
+            Task { @MainActor [weak self] in
+                self?.openHistoryIfMouseIsInsideCollapsedEntry()
+            }
+            return event
+        }
+    }
+
+    private func removeHistoryClickMonitors() {
+        if let globalHistoryClickMonitor {
+            NSEvent.removeMonitor(globalHistoryClickMonitor)
+            self.globalHistoryClickMonitor = nil
+        }
+        if let localHistoryClickMonitor {
+            NSEvent.removeMonitor(localHistoryClickMonitor)
+            self.localHistoryClickMonitor = nil
+        }
+    }
+
+    private func openHistoryIfMouseIsInsideCollapsedEntry() {
+        guard appState.isCollapsedHistoryEntry,
+              isMouseInsideCollapsedHistoryEntry() else {
+            return
+        }
+
+        appState.openHistory()
+    }
+
+    private func updateRecordingHoverFromMouseLocation() {
+        guard case .recording = appState.phase else { return }
+
+        let now = CACurrentMediaTime()
+        guard now - lastRecordingHoverMouseCheckAt >= recordingHoverMouseCheckInterval else { return }
+        lastRecordingHoverMouseCheckAt = now
+
+        if isMouseInsideRecordingIslandRegion() {
+            if !appState.islandHovering {
+                appState.setIslandHovering(true)
+            }
+        } else if appState.islandHovering {
+            appState.setIslandHovering(false)
+        }
+    }
+
     func show() {
+        if case .recording = appState.phase {
+            installMouseTrackingMonitors()
+        } else {
+            removeMouseTrackingMonitors()
+        }
+        if appState.isCollapsedHistoryEntry {
+            installHistoryClickMonitors()
+        } else {
+            removeHistoryClickMonitors()
+        }
+
         let activePanel = panel(for: appState.phase)
         let activeHostingView = hostingView(for: appState.phase)
         let inactivePanel = inactivePanel(for: appState.phase)
 
-        activeHostingView.invalidateIntrinsicContentSize()
-        let idealSize = activeHostingView.fittingSize
-        let width = max(idealSize.width, 240)
-        let height = max(idealSize.height, 44)
+        let isCollapsedRecording: Bool
+        if case .recording = appState.phase {
+            isCollapsedRecording = !appState.isRecordingIslandExpanded
+        } else {
+            isCollapsedRecording = false
+        }
+        let isCollapsedHistory: Bool
+        if case .idle = appState.phase {
+            isCollapsedHistory = appState.shouldShowIdleIsland && !appState.historyOpen
+        } else {
+            isCollapsedHistory = false
+        }
+        let isNotchAttachedExpansion: Bool
+        if case .recording = appState.phase {
+            isNotchAttachedExpansion = appState.isRecordingIslandExpanded
+        } else if case .idle = appState.phase {
+            isNotchAttachedExpansion = appState.historyOpen
+        } else {
+            isNotchAttachedExpansion = false
+        }
+        let screenGeometry = NSScreen.typenoNotchPreferred.map {
+            ScreenGeometry(
+                frame: $0.frame,
+                visibleFrame: $0.visibleFrame,
+                safeAreaTop: $0.safeAreaInsets.top,
+                auxiliaryTopLeftArea: $0.auxiliaryTopLeftArea ?? .zero,
+                auxiliaryTopRightArea: $0.auxiliaryTopRightArea ?? .zero
+            )
+        }
+        let overlayPlan = screenGeometry.flatMap {
+            appState.updateIslandLayout(for: $0)
+        }
+        let layoutWidth = appState.islandWidth
+        let collapsedLayoutWidth = appState.collapsedRecordingRailWidth
+        let activeLayoutWidth: CGFloat
+        if isCollapsedRecording || isCollapsedHistory {
+            activeLayoutWidth = collapsedLayoutWidth
+        } else if case .idle = appState.phase, appState.historyOpen {
+            activeLayoutWidth = appState.historyPanelWidth
+        } else if case .recording = appState.phase, appState.isRecordingIslandExpanded {
+            activeLayoutWidth = appState.previewPanelWidth
+        } else {
+            activeLayoutWidth = layoutWidth
+        }
+        let usesIslandLayout: Bool
+        if case .permissions = appState.phase {
+            usesIslandLayout = false
+        } else if case .missingColi = appState.phase {
+            usesIslandLayout = false
+        } else if case .installingColi = appState.phase {
+            usesIslandLayout = false
+        } else {
+            usesIslandLayout = true
+        }
+        if !usesIslandLayout {
+            appState.updateTopOverlayHost(active: false)
+        }
 
-        if let screen = NSScreen.main {
+        let measuringView = usesIslandLayout ? measuringHostingView : activeHostingView
+        measuringView.invalidateIntrinsicContentSize()
+        let idealSize = measuringView.fittingSize
+        let minimumWidth: CGFloat
+        if isCollapsedHistory {
+            minimumWidth = usesIslandLayout ? activeLayoutWidth : CompactIslandMetrics.collapsedRecordingSideSlotWidth
+        } else if isCollapsedRecording {
+            minimumWidth = usesIslandLayout ? activeLayoutWidth : CompactIslandMetrics.collapsedRecordingWidth
+        } else {
+            minimumWidth = usesIslandLayout ? activeLayoutWidth : 240
+        }
+        let minimumHeight: CGFloat
+        if isCollapsedRecording || isCollapsedHistory {
+            minimumHeight = CompactIslandMetrics.collapsedRecordingHeight
+        } else if isNotchAttachedExpansion {
+            minimumHeight = minimumNotchAttachedExpansionHeight()
+        } else {
+            minimumHeight = CompactIslandMetrics.minimumHeight
+        }
+        let width: CGFloat
+        if usesIslandLayout, let overlayPlan {
+            width = overlayPlan.panelFrame.width
+        } else if isCollapsedHistory {
+            width = minimumWidth
+        } else {
+            width = max(idealSize.width, minimumWidth)
+        }
+
+        let height: CGFloat
+        if usesIslandLayout, let overlayPlan {
+            height = overlayPlan.panelFrame.height
+        } else if isCollapsedRecording || isCollapsedHistory {
+            height = CompactIslandMetrics.collapsedRecordingHeight
+        } else {
+            height = max(idealSize.height, minimumHeight)
+        }
+
+        if let screen = NSScreen.typenoNotchPreferred {
             let frame = screen.visibleFrame
+            let panelFrame: NSRect
             let x: CGFloat
             let y: CGFloat
 
@@ -2201,37 +3361,231 @@ final class OverlayPanelController {
             } else if case .installingColi = appState.phase {
                 x = frame.maxX - width - 16
                 y = frame.maxY - height - 16
+            } else if usesIslandLayout, let overlayPlan {
+                x = overlayPlan.panelFrame.minX
+                y = overlayPlan.panelFrame.minY
+            } else if let screenGeometry {
+                // Collapsed states hug the hardware notch; expanded panels grow from the top edge.
+                let islandFrame: CGRect
+                if isCollapsedRecording {
+                    islandFrame = OverlayGeometry.collapsedRecordingFrame(
+                        panelSize: NSSize(width: width, height: height),
+                        screen: screenGeometry
+                    )
+                } else if isCollapsedHistory {
+                    islandFrame = OverlayGeometry.collapsedRecordingFrame(
+                        panelSize: NSSize(width: width, height: height),
+                        screen: screenGeometry
+                    )
+                } else if isNotchAttachedExpansion {
+                    islandFrame = OverlayGeometry.notchAttachedIslandFrame(
+                        panelSize: NSSize(width: width, height: height),
+                        screen: screenGeometry
+                    )
+                } else {
+                    islandFrame = OverlayGeometry.compactIslandFrame(
+                        panelSize: NSSize(width: width, height: height),
+                        screen: screenGeometry
+                    )
+                }
+                x = islandFrame.minX
+                y = islandFrame.minY
             } else {
-                // Recording/transcription bar: center bottom, fixed width
-                x = frame.midX - 360 / 2
-                y = frame.minY + 48
+                x = frame.midX - width / 2
+                y = frame.maxY - height - 8
             }
 
-            let panelFrame = NSRect(x: x, y: y, width: width, height: height)
-            activePanel.setFrame(panelFrame, display: true)
+            if usesIslandLayout {
+                let hostFrame = overlayPlan?.hostFrame ?? CGRect(
+                    x: screen.frame.minX,
+                    y: screen.frame.maxY - max(CGFloat(420), height + (screen.frame.maxY - (y + height))),
+                    width: screen.frame.width,
+                    height: max(CGFloat(420), height + (screen.frame.maxY - (y + height)))
+                )
+                let contentFrame = overlayPlan?.contentFrame ?? CGRect(
+                    x: x - screen.frame.minX,
+                    y: screen.frame.maxY - (y + height),
+                    width: width,
+                    height: height
+                )
+                appState.updateTopOverlayHost(
+                    active: true,
+                    hostWidth: hostFrame.width,
+                    hostHeight: hostFrame.height,
+                    contentFrame: contentFrame
+                )
+                activeHostingView.invalidateIntrinsicContentSize()
+                panelFrame = hostFrame
+            } else {
+                panelFrame = NSRect(x: x, y: y, width: width, height: height)
+            }
+
+            let shouldBridgePanels = usesIslandLayout
+                && !activePanel.isVisible
+                && inactivePanel.isVisible
+            if shouldBridgePanels {
+                activePanel.setFrame(inactivePanel.frame, display: false)
+                present(panel: activePanel)
+                inactivePanel.orderOut(nil)
+            }
+            setFrame(panelFrame, for: activePanel, animated: usesIslandLayout)
         } else {
             activePanel.setContentSize(NSSize(width: width, height: height))
         }
 
-        if shouldCaptureKeyboard(for: appState.phase) {
-            NSApp.activate(ignoringOtherApps: true)
-            capturePanel.makeKeyAndOrderFront(nil)
-            capturePanel.makeFirstResponder(capturePanel.contentView)
-        } else {
-            activePanel.orderFrontRegardless()
+        if !activePanel.isVisible {
+            present(panel: activePanel)
         }
         inactivePanel.orderOut(nil)
     }
 
     func hide() {
+        removeMouseTrackingMonitors()
+        removeHistoryClickMonitors()
+        appState.updateTopOverlayHost(active: false)
         hudPanel.orderOut(nil)
         capturePanel.orderOut(nil)
+    }
+
+    private func setFrame(_ frame: NSRect, for panel: NSPanel, animated: Bool) {
+        guard animated,
+              panel.isVisible,
+              panel.frame != frame else {
+            panel.setFrame(frame, display: true)
+            return
+        }
+
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = islandFrameAnimationDuration
+            context.timingFunction = CAMediaTimingFunction(controlPoints: 0.18, 0.0, 0.16, 1.0)
+            context.allowsImplicitAnimation = true
+            panel.animator().setFrame(frame, display: true)
+        }
+    }
+
+    private func present(panel: NSPanel) {
+        if panel === capturePanel {
+            NSApp.activate(ignoringOtherApps: true)
+            capturePanel.makeKeyAndOrderFront(nil)
+            capturePanel.makeFirstResponder(capturePanel.contentView)
+        } else {
+            panel.orderFrontRegardless()
+        }
+    }
+
+    func isMouseInsideRecordingIslandRegion() -> Bool {
+        guard let screen = NSScreen.typenoNotchPreferred else { return false }
+
+        let screenGeometry = ScreenGeometry(
+            frame: screen.frame,
+            visibleFrame: screen.visibleFrame,
+            safeAreaTop: screen.safeAreaInsets.top,
+            auxiliaryTopLeftArea: screen.auxiliaryTopLeftArea ?? .zero,
+            auxiliaryTopRightArea: screen.auxiliaryTopRightArea ?? .zero
+        )
+        let measurements = OverlayMeasurements(
+            previewTextSize: appState.overlayLayoutPlan?.viewportHeight.map {
+                CGSize(width: 0, height: $0)
+            }
+        )
+        let collapsedPlan = OverlayLayoutPlanner.makePlan(
+            OverlayLayoutRequest(
+                screen: screenGeometry,
+                scene: .recording(
+                    RecordingOverlayScene(
+                        isExpanded: false,
+                        previewText: appState.previewTranscript,
+                        elapsedText: appState.recordingElapsedStr
+                    )
+                ),
+                measurements: measurements
+            )
+        )
+        let expandedFrame = appState.overlayLayoutPlan?.panelFrame ?? collapsedPlan.panelFrame
+        return OverlayGeometry.recordingHoverRegionContains(
+            NSEvent.mouseLocation,
+            collapsedFrame: collapsedPlan.panelFrame,
+            expandedFrame: expandedFrame
+        )
+    }
+
+    private func isMouseInsideCollapsedHistoryEntry() -> Bool {
+        if let frame = appState.overlayLayoutPlan?.panelFrame {
+            return frame.insetBy(dx: -18, dy: -10).contains(NSEvent.mouseLocation)
+        }
+
+        guard let screen = NSScreen.typenoNotchPreferred else { return false }
+        let screenGeometry = ScreenGeometry(
+            frame: screen.frame,
+            visibleFrame: screen.visibleFrame,
+            safeAreaTop: screen.safeAreaInsets.top,
+            auxiliaryTopLeftArea: screen.auxiliaryTopLeftArea ?? .zero,
+            auxiliaryTopRightArea: screen.auxiliaryTopRightArea ?? .zero
+        )
+        let frame = OverlayGeometry.collapsedRecordingFrame(
+            panelSize: NSSize(
+                width: CompactIslandMetrics.collapsedRecordingWidth(for: screenGeometry),
+                height: CompactIslandMetrics.collapsedRecordingHeight
+            ),
+            screen: screenGeometry
+        )
+        return frame.insetBy(dx: -18, dy: -10).contains(NSEvent.mouseLocation)
+    }
+
+    private func minimumNotchAttachedExpansionHeight() -> CGFloat {
+        let attachmentHeight = appState.notchAttachmentHeight
+
+        if case .idle = appState.phase, appState.historyOpen {
+            let textLengths = appState.transcriptHistory.items.map { $0.text.count }
+            let estimatedRowsHeight = CompactIslandMetrics.historyRowsViewportHeight(
+                forTextLengths: textLengths,
+                panelWidth: appState.historyPanelWidth
+            )
+            if textLengths.count == 1 {
+                return attachmentHeight + 16 + max(30, estimatedRowsHeight)
+            }
+
+            let headerHeight: CGFloat = 18
+            let panelVerticalPadding: CGFloat = 20
+            let contentSpacing: CGFloat = 6
+
+            return attachmentHeight
+                + headerHeight
+                + panelVerticalPadding
+                + contentSpacing
+                + estimatedRowsHeight
+        }
+
+        if case .recording = appState.phase {
+            let previewText = appState.previewTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !previewText.isEmpty else {
+                return attachmentHeight + CompactIslandMetrics.minimumHeight
+            }
+
+            let estimatedCharactersPerLine = max(18, Int((appState.previewPanelWidth - 112) / 7))
+            let estimatedLineCount = max(
+                1,
+                Int(ceil(Double(previewText.count) / Double(estimatedCharactersPerLine)))
+            )
+            let estimatedTextHeight = min(
+                CompactIslandMetrics.maximumTextViewportHeight,
+                CGFloat(estimatedLineCount) * 17
+            )
+
+            return attachmentHeight
+                + 20
+                + max(18, estimatedTextHeight)
+        }
+
+        return attachmentHeight + CompactIslandMetrics.minimumHeight
     }
 
     private func shouldCaptureKeyboard(for phase: AppPhase) -> Bool {
         switch phase {
         case .recording, .transcribing:
             true
+        case .idle:
+            false
         default:
             false
         }
@@ -2239,11 +3593,11 @@ final class OverlayPanelController {
 
     private func configure(panel: NSPanel, contentView: NSView) {
         panel.isFloatingPanel = true
-        panel.level = .statusBar
+        panel.level = .mainMenu + 3
         panel.backgroundColor = .clear
         panel.isOpaque = false
         panel.hasShadow = false
-        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
         panel.hidesOnDeactivate = false
         panel.contentView = contentView
     }
@@ -2264,75 +3618,666 @@ final class OverlayPanelController {
 // MARK: - Overlay View
 
 struct BreathingDot: View {
-    @State private var isBreathing = false
+    var color: Color = .white
 
     var body: some View {
-        Circle()
-            .fill(Color.white.opacity(isBreathing ? 0.7 : 0.25))
-            .frame(width: 6, height: 6)
-            .animation(.easeInOut(duration: 1.0).repeatForever(autoreverses: true), value: isBreathing)
-            .onAppear { isBreathing = true }
+        TimelineView(.periodic(from: .now, by: 1.2)) { context in
+            let pulseIndex = Int(context.date.timeIntervalSinceReferenceDate / 1.2)
+            let isLit = pulseIndex.isMultiple(of: 2)
+
+            Circle()
+                .fill(color.opacity(isLit ? 0.86 : 0.42))
+                .frame(width: 6, height: 6)
+                .animation(.easeInOut(duration: 0.18), value: isLit)
+        }
+    }
+}
+
+struct NotchSurfaceShape: Shape {
+    var topCornerRadius: CGFloat
+    var bottomCornerRadius: CGFloat
+
+    var animatableData: AnimatablePair<CGFloat, CGFloat> {
+        get { AnimatablePair(topCornerRadius, bottomCornerRadius) }
+        set {
+            topCornerRadius = newValue.first
+            bottomCornerRadius = newValue.second
+        }
+    }
+
+    func path(in rect: CGRect) -> Path {
+        let topRadius = min(topCornerRadius, rect.width / 2, rect.height / 2)
+        let bottomRadius = min(bottomCornerRadius, rect.width / 2, rect.height / 2)
+        var path = Path()
+
+        path.move(to: CGPoint(x: rect.minX, y: rect.minY))
+        path.addQuadCurve(
+            to: CGPoint(x: rect.minX + topRadius, y: rect.minY + topRadius),
+            control: CGPoint(x: rect.minX + topRadius, y: rect.minY)
+        )
+        path.addLine(to: CGPoint(x: rect.minX + topRadius, y: rect.maxY - bottomRadius))
+        path.addQuadCurve(
+            to: CGPoint(x: rect.minX + topRadius + bottomRadius, y: rect.maxY),
+            control: CGPoint(x: rect.minX + topRadius, y: rect.maxY)
+        )
+        path.addLine(to: CGPoint(x: rect.maxX - topRadius - bottomRadius, y: rect.maxY))
+        path.addQuadCurve(
+            to: CGPoint(x: rect.maxX - topRadius, y: rect.maxY - bottomRadius),
+            control: CGPoint(x: rect.maxX - topRadius, y: rect.maxY)
+        )
+        path.addLine(to: CGPoint(x: rect.maxX - topRadius, y: rect.minY + topRadius))
+        path.addQuadCurve(
+            to: CGPoint(x: rect.maxX, y: rect.minY),
+            control: CGPoint(x: rect.maxX - topRadius, y: rect.minY)
+        )
+        path.addLine(to: CGPoint(x: rect.minX, y: rect.minY))
+        path.closeSubpath()
+
+        return path
+    }
+}
+
+private struct CompactTextSizePreferenceKey: PreferenceKey {
+    static let defaultValue: CGSize = CGSize(width: 0, height: 18)
+
+    static func reduce(value: inout CGSize, nextValue: () -> CGSize) {
+        let next = nextValue()
+        value = CGSize(width: max(value.width, next.width), height: max(value.height, next.height))
+    }
+}
+
+private struct HistoryRowSizePreferenceKey: PreferenceKey {
+    static let defaultValue: [UUID: CGSize] = [:]
+
+    static func reduce(value: inout [UUID: CGSize], nextValue: () -> [UUID: CGSize]) {
+        value.merge(nextValue()) { current, next in
+            CGSize(width: max(current.width, next.width), height: max(current.height, next.height))
+        }
     }
 }
 
 struct OverlayView: View {
     @ObservedObject var appState: AppState
+    var forceContentOnly = false
+    @State private var copiedHistoryID: UUID?
+    @State private var compactTextContentHeight: CGFloat = 18
+
+    private var notchMorphAnimation: Animation {
+        .smooth(duration: 0.28)
+    }
+
+    private var notchMicroAnimation: Animation {
+        .easeOut(duration: 0.16)
+    }
+
+    private func contentFadeInAnimation(active: Bool) -> Animation {
+        active ? .easeOut(duration: 0.16).delay(0.08) : .easeOut(duration: 0.08)
+    }
+
+    private func contentFadeOutAnimation(active: Bool) -> Animation {
+        active ? .easeOut(duration: 0.08) : .easeOut(duration: 0.16).delay(0.08)
+    }
 
     var body: some View {
+        if appState.usesTopOverlayHost && !forceContentOnly {
+            ZStack(alignment: .topLeading) {
+                overlayContent
+                    .fixedSize()
+                    .offset(x: appState.overlayContentX, y: appState.overlayContentY)
+                    .animation(
+                        notchMorphAnimation,
+                        value: appState.overlayContentX
+                    )
+                    .animation(
+                        notchMorphAnimation,
+                        value: appState.overlayContentY
+                    )
+            }
+            .frame(
+                width: appState.overlayHostWidth,
+                height: appState.overlayHostHeight,
+                alignment: .topLeading
+            )
+        } else {
+            overlayContent
+                .fixedSize()
+        }
+    }
+
+    @ViewBuilder
+    private var overlayContent: some View {
         Group {
             switch appState.phase {
+            case .recording:
+                recordingIslandView
+            case .idle:
+                idleIslandView
             case .permissions(let missing):
                 permissionView(missing: missing)
             case .missingColi:
                 missingColiView
             case .installingColi(let message):
                 installingColiView(message: message)
-            case .idle:
-                EmptyView()
             default:
                 compactView
             }
         }
-        .fixedSize()
+    }
+
+    @ViewBuilder
+    private var recordingIslandView: some View {
+        let expanded = appState.isRecordingIslandExpanded
+        morphingNotchSurface(
+            width: expanded ? appState.previewPanelWidth : appState.collapsedRecordingRailWidth,
+            height: expanded ? max(appState.overlayContentHeight, CompactIslandMetrics.minimumHeight) : CompactIslandMetrics.collapsedRecordingHeight,
+            topCornerRadius: expanded ? 16 : 6,
+            bottomCornerRadius: expanded ? 20 : 14
+        ) {
+            ZStack(alignment: .top) {
+                recordingCollapsedContent
+                    .frame(
+                        width: appState.collapsedRecordingRailWidth,
+                        height: CompactIslandMetrics.collapsedRecordingHeight
+                    )
+                    .opacity(expanded ? 0 : 1)
+                    .allowsHitTesting(!expanded)
+                    .animation(contentFadeOutAnimation(active: expanded), value: expanded)
+
+                VStack(spacing: 0) {
+                    Color.clear
+                        .frame(height: appState.notchAttachmentHeight)
+
+                    compactEmbeddedView
+                }
+                .frame(width: appState.previewPanelWidth, alignment: .top)
+                .opacity(expanded ? 1 : 0)
+                .allowsHitTesting(expanded)
+                .animation(contentFadeInAnimation(active: expanded), value: expanded)
+            }
+        }
+        .contentShape(Rectangle())
+        .onHover { hovering in
+            appState.setIslandHovering(hovering)
+        }
+        .onTapGesture {
+            appState.toggleRecordingIsland()
+        }
+        .animation(
+            notchMorphAnimation,
+            value: appState.isRecordingIslandExpanded
+        )
+    }
+
+    private var recordingExpandedView: some View {
+        Group {
+            if appState.notchAttachmentHeight > 0 {
+                notchAttachedSurface(width: appState.previewPanelWidth) {
+                    compactEmbeddedView
+                }
+            } else {
+                compactView
+            }
+        }
+        .animation(
+            notchMorphAnimation,
+            value: appState.collapsedRecordingSpacerWidth
+        )
+    }
+
+    @ViewBuilder
+    private var idleIslandView: some View {
+        if appState.shouldShowIdleIsland {
+            let expanded = appState.historyOpen
+            morphingNotchSurface(
+                width: expanded ? appState.historyPanelWidth : appState.collapsedRecordingRailWidth,
+                height: expanded ? max(appState.overlayContentHeight, CompactIslandMetrics.minimumHeight) : CompactIslandMetrics.collapsedRecordingHeight,
+                topCornerRadius: expanded ? 16 : 6,
+                bottomCornerRadius: expanded ? 20 : 14
+            ) {
+                ZStack(alignment: .top) {
+                    historyCollapsedButtonContent
+                        .opacity(expanded ? 0 : 1)
+                        .allowsHitTesting(!expanded)
+                        .animation(contentFadeOutAnimation(active: expanded), value: expanded)
+
+                    VStack(spacing: 0) {
+                        Color.clear
+                            .frame(height: appState.notchAttachmentHeight)
+
+                        historyPanelEmbeddedView
+                    }
+                    .frame(width: appState.historyPanelWidth, alignment: .top)
+                    .opacity(expanded ? 1 : 0)
+                    .allowsHitTesting(expanded)
+                    .animation(contentFadeInAnimation(active: expanded), value: expanded)
+                }
+            }
+            .contentShape(Rectangle())
+            .animation(notchMorphAnimation, value: appState.historyOpen)
+        } else {
+            EmptyView()
+        }
+    }
+
+    @ViewBuilder
+    private var notchAttachedHistoryPanelView: some View {
+        if appState.notchAttachmentHeight > 0 {
+            notchAttachedSurface(width: appState.historyPanelWidth) {
+                historyPanelEmbeddedView
+            }
+        } else {
+            historyPanelView
+        }
+    }
+
+    private func notchAttachedSurface<Content: View>(
+        width: CGFloat? = nil,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        let shape = NotchSurfaceShape(topCornerRadius: 16, bottomCornerRadius: 20)
+        let surfaceWidth = width ?? appState.islandWidth
+
+        return ZStack(alignment: .top) {
+            shape
+                .fill(notchSurfaceFill)
+
+            VStack(spacing: 0) {
+                Color.clear
+                    .frame(height: appState.notchAttachmentHeight)
+
+                content()
+            }
+        }
+        .frame(width: surfaceWidth)
+        .clipShape(shape)
+        .compositingGroup()
+        .shadow(color: .black.opacity(0.26), radius: 14, y: 5)
+    }
+
+    private var recordingCollapsedView: some View {
+        morphingNotchSurface(
+            width: appState.collapsedRecordingRailWidth,
+            height: CompactIslandMetrics.collapsedRecordingHeight,
+            topCornerRadius: 6,
+            bottomCornerRadius: 14
+        ) {
+            recordingCollapsedContent
+        }
+    }
+
+    private var recordingCollapsedContent: some View {
+        HStack(spacing: 0) {
+            HStack(spacing: 6) {
+                BreathingDot(color: Color(red: 1.0, green: 0.24, blue: 0.18))
+                Text("REC")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.72))
+            }
+            .padding(.horizontal, 12)
+            .frame(
+                width: CompactIslandMetrics.collapsedRecordingSideSlotWidth,
+                height: CompactIslandMetrics.collapsedRecordingHeight,
+                alignment: .trailing
+            )
+
+            Spacer(minLength: appState.collapsedRecordingSpacerWidth)
+
+            Text(appState.recordingElapsedStr)
+                .font(.system(size: 12, weight: .medium, design: .monospaced))
+                .foregroundStyle(.white.opacity(0.72))
+                .padding(.horizontal, 12)
+                .frame(
+                    width: CompactIslandMetrics.collapsedRecordingSideSlotWidth,
+                    height: CompactIslandMetrics.collapsedRecordingHeight,
+                    alignment: .leading
+                )
+        }
+        .frame(
+            width: appState.collapsedRecordingRailWidth,
+            height: CompactIslandMetrics.collapsedRecordingHeight
+        )
+        .animation(
+            notchMicroAnimation,
+            value: appState.collapsedRecordingSpacerWidth
+        )
+    }
+
+    private func morphingNotchSurface<Content: View>(
+        width: CGFloat,
+        height: CGFloat,
+        topCornerRadius: CGFloat,
+        bottomCornerRadius: CGFloat,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        let shape = NotchSurfaceShape(
+            topCornerRadius: topCornerRadius,
+            bottomCornerRadius: bottomCornerRadius
+        )
+
+        return ZStack(alignment: .top) {
+            shape
+                .fill(notchSurfaceFill)
+
+            content()
+        }
+        .frame(width: width, height: height, alignment: .top)
+        .clipShape(shape)
+        .contentShape(shape)
+        .compositingGroup()
+        .shadow(
+            color: .black.opacity(height > CompactIslandMetrics.collapsedRecordingHeight ? 0.26 : 0),
+            radius: 14,
+            y: 5
+        )
+        .animation(notchMorphAnimation, value: width)
+        .animation(notchMorphAnimation, value: height)
+        .animation(notchMorphAnimation, value: topCornerRadius)
+        .animation(notchMorphAnimation, value: bottomCornerRadius)
+    }
+
+    private func compactNotchSurface<Content: View>(
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        let shape = NotchSurfaceShape(topCornerRadius: 6, bottomCornerRadius: 14)
+
+        return ZStack {
+            shape
+                .fill(notchSurfaceFill)
+
+            content()
+        }
+        .frame(
+            width: appState.collapsedRecordingRailWidth,
+            height: CompactIslandMetrics.collapsedRecordingHeight,
+            alignment: .center
+        )
+        .clipShape(shape)
+        .contentShape(shape)
+        .compositingGroup()
+    }
+
+    private var notchSurfaceFill: LinearGradient {
+        LinearGradient(
+            colors: [
+                Color.black.opacity(0.98),
+                Color(red: 0.035, green: 0.035, blue: 0.04).opacity(0.98)
+            ],
+            startPoint: .top,
+            endPoint: .bottom
+        )
+    }
+
+    private var historyCollapsedView: some View {
+        Button {
+            appState.openHistory()
+        } label: {
+            morphingNotchSurface(
+                width: appState.collapsedRecordingRailWidth,
+                height: CompactIslandMetrics.collapsedRecordingHeight,
+                topCornerRadius: 6,
+                bottomCornerRadius: 14
+            ) {
+                historyCollapsedContent
+            }
+        }
+        .buttonStyle(.plain)
+        .frame(
+            width: appState.collapsedRecordingRailWidth,
+            height: CompactIslandMetrics.collapsedRecordingHeight,
+            alignment: .center
+        )
+        .contentShape(
+            NotchSurfaceShape(topCornerRadius: 6, bottomCornerRadius: 14)
+        )
+        .animation(
+            notchMicroAnimation,
+            value: appState.transcriptHistory.items.count
+        )
+    }
+
+    private var historyCollapsedButtonContent: some View {
+        Button {
+            appState.openHistory()
+        } label: {
+            historyCollapsedContent
+        }
+        .buttonStyle(.plain)
+        .frame(
+            width: appState.collapsedRecordingRailWidth,
+            height: CompactIslandMetrics.collapsedRecordingHeight,
+            alignment: .center
+        )
+        .contentShape(Rectangle())
+    }
+
+    private var historyCollapsedContent: some View {
+        HStack(spacing: 0) {
+            HStack(spacing: 7) {
+                Image(systemName: "clock.arrow.circlepath")
+                    .font(.system(size: 12, weight: .medium))
+                Text("\(appState.transcriptHistory.items.count)")
+                    .font(.system(size: 12, weight: .semibold, design: .rounded))
+            }
+            .foregroundStyle(.white.opacity(0.78))
+            .padding(.horizontal, 12)
+            .frame(
+                width: CompactIslandMetrics.collapsedRecordingSideSlotWidth,
+                height: CompactIslandMetrics.collapsedRecordingHeight,
+                alignment: .trailing
+            )
+
+            Spacer(minLength: appState.collapsedRecordingSpacerWidth)
+
+            Color.clear
+                .frame(
+                    width: CompactIslandMetrics.collapsedRecordingSideSlotWidth,
+                    height: CompactIslandMetrics.collapsedRecordingHeight
+                )
+        }
+        .frame(
+            width: appState.collapsedRecordingRailWidth,
+            height: CompactIslandMetrics.collapsedRecordingHeight
+        )
+    }
+
+    private var historyPanelView: some View {
+        historyPanelContent
+            .padding(.horizontal, historyHorizontalPadding)
+            .padding(.vertical, 10)
+            .frame(width: appState.historyPanelWidth)
+            .background(
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .fill(Color(white: 0.13))
+            )
+            .shadow(color: .black.opacity(0.3), radius: 12, y: 4)
+    }
+
+    private var historyPanelEmbeddedView: some View {
+        historyPanelContent
+            .padding(.horizontal, historyHorizontalPadding)
+            .padding(.vertical, 10)
+            .frame(width: appState.historyPanelWidth)
+    }
+
+    private var historyHorizontalPadding: CGFloat {
+        22
+    }
+
+    private var historyPanelContent: some View {
+        Group {
+            if appState.transcriptHistory.items.count == 1,
+               let item = appState.transcriptHistory.items.first {
+                singleHistoryRow(item)
+            } else {
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(spacing: 8) {
+                        Image(systemName: "clock.arrow.circlepath")
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundStyle(.white.opacity(0.58))
+
+                        Text(L("History", "历史"))
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(.white.opacity(0.78))
+
+                        Spacer()
+
+                        Button {
+                            appState.closeHistory()
+                        } label: {
+                            Image(systemName: "xmark")
+                                .font(.system(size: 10, weight: .medium))
+                                .foregroundStyle(.white.opacity(0.5))
+                                .frame(width: 20, height: 20)
+                        }
+                        .buttonStyle(.plain)
+                    }
+
+                    ScrollView(.vertical) {
+                        VStack(alignment: .leading, spacing: 8) {
+                            ForEach(appState.transcriptHistory.items) { item in
+                                historyRow(item)
+                            }
+                        }
+                    }
+                    .frame(height: historyRowsViewportHeight)
+                }
+            }
+        }
+        .onPreferenceChange(HistoryRowSizePreferenceKey.self) { sizes in
+            appState.updateMeasuredHistoryRowSizes(sizes)
+        }
+    }
+
+    private func singleHistoryRow(_ item: TranscriptHistoryItem) -> some View {
+        HStack(alignment: .center, spacing: 8) {
+            Text(item.text)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.88))
+                .lineLimit(2)
+                .truncationMode(.tail)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            Button {
+                appState.copyHistoryItem(item)
+                copiedHistoryID = item.id
+            } label: {
+                Image(systemName: copiedHistoryID == item.id ? "checkmark" : "doc.on.doc")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.white.opacity(copiedHistoryID == item.id ? 0.86 : 0.56))
+                    .frame(width: 24, height: 24)
+            }
+            .buttonStyle(.plain)
+            .help(L("Copy", "复制"))
+
+            Button {
+                appState.closeHistory()
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(.white.opacity(0.5))
+                    .frame(width: 22, height: 24)
+            }
+            .buttonStyle(.plain)
+        }
+        .frame(minHeight: 30)
+        .background(
+            GeometryReader { proxy in
+                Color.clear.preference(
+                    key: HistoryRowSizePreferenceKey.self,
+                    value: [item.id: proxy.size]
+                )
+            }
+        )
+    }
+
+    private func historyRow(_ item: TranscriptHistoryItem) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            Text(item.text)
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(.white.opacity(0.86))
+                .lineLimit(2)
+                .truncationMode(.tail)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            Button {
+                appState.copyHistoryItem(item)
+                copiedHistoryID = item.id
+            } label: {
+                Image(systemName: copiedHistoryID == item.id ? "checkmark" : "doc.on.doc")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.white.opacity(copiedHistoryID == item.id ? 0.86 : 0.52))
+                    .frame(width: 22, height: 22)
+            }
+            .buttonStyle(.plain)
+            .help(L("Copy", "复制"))
+        }
+        .padding(.vertical, 6)
+        .background(
+            GeometryReader { proxy in
+                Color.clear.preference(
+                    key: HistoryRowSizePreferenceKey.self,
+                    value: [item.id: proxy.size]
+                )
+            }
+        )
+    }
+
+    private var historyRowsViewportHeight: CGFloat {
+        max(26, appState.overlayHistoryRowsViewportHeight)
     }
 
     var compactView: some View {
-        HStack(spacing: 8) {
+        compactContentView
+            .padding(.horizontal, compactHorizontalPadding)
+            .padding(.vertical, 10)
+            .frame(width: currentCompactPanelWidth)
+            .background(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(Color(white: 0.15))
+            )
+            .shadow(color: .black.opacity(0.3), radius: 12, y: 4)
+    }
+
+    private var compactEmbeddedView: some View {
+        compactContentView
+            .padding(.horizontal, compactHorizontalPadding)
+            .padding(.vertical, 10)
+            .frame(width: currentCompactPanelWidth)
+    }
+
+    private var compactHorizontalPadding: CGFloat {
+        if case .recording = appState.phase {
+            return 24
+        }
+
+        return 14
+    }
+
+    private var currentCompactPanelWidth: CGFloat {
+        if case .recording = appState.phase, appState.isRecordingIslandExpanded {
+            return appState.previewPanelWidth
+        }
+
+        return appState.islandWidth
+    }
+
+    private var compactContentView: some View {
+        HStack(alignment: .top, spacing: 8) {
             // Left indicator
             if case .recording = appState.phase {
                 BreathingDot()
+                    .padding(.top, 6)
             } else if case .transcribing = appState.phase {
                 ProgressView()
                     .controlSize(.mini)
+                    .padding(.top, 2)
             } else if case .updating = appState.phase {
                 ProgressView()
                     .controlSize(.mini)
+                    .padding(.top, 2)
             }
 
-            // Text content — single line
-            Group {
-                if case .done(let text) = appState.phase {
-                    Text(text)
-                        .foregroundStyle(.white)
-                } else if case .recording = appState.phase {
-                    if appState.previewTranscript.isEmpty {
-                        Text(L("Listening...", "聆听中..."))
-                            .foregroundStyle(.white.opacity(0.35))
-                    } else {
-                        Text(appState.previewTranscript)
-                            .foregroundStyle(.white.opacity(0.9))
-                    }
-                } else if case .error = appState.phase {
-                    Text(appState.phase.subtitle)
-                        .foregroundStyle(.red.opacity(0.9))
-                } else {
-                    Text(appState.phase.subtitle)
-                        .foregroundStyle(.white.opacity(0.7))
-                }
-            }
-            .font(.system(size: 14))
-            .lineLimit(1)
-            .truncationMode(.head)
+            compactTextView
 
             Spacer(minLength: 0)
 
@@ -2342,6 +4287,7 @@ struct OverlayView: View {
                     .font(.system(size: 12, design: .monospaced))
                     .foregroundStyle(.white.opacity(0.4))
                     .fixedSize()
+                    .padding(.top, 1)
             }
 
             if case .error = appState.phase {
@@ -2353,16 +4299,142 @@ struct OverlayView: View {
                         .foregroundStyle(.white.opacity(0.5))
                 }
                 .buttonStyle(.plain)
+                .padding(.top, 2)
             }
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 10)
-        .frame(width: 360)
-        .background(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .fill(Color(white: 0.15))
+    }
+
+    @ViewBuilder
+    private var compactTextView: some View {
+        if shouldScrollCompactText {
+            ScrollViewReader { proxy in
+                ScrollView(.vertical) {
+                    VStack(alignment: .leading, spacing: 0) {
+                        compactTextContent
+                            .lineLimit(nil)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .frame(width: compactTextColumnWidth, alignment: .leading)
+                            .background(
+                                GeometryReader { proxy in
+                                    Color.clear.preference(
+                                        key: CompactTextSizePreferenceKey.self,
+                                        value: proxy.size
+                                    )
+                                }
+                            )
+
+                        Color.clear
+                            .frame(height: 1)
+                            .id(compactTextBottomID)
+                    }
+                }
+                .frame(height: compactTextViewportHeight)
+                .onAppear {
+                    proxy.scrollTo(compactTextBottomID, anchor: .bottom)
+                }
+                .onChange(of: compactTextScrollKey) { _, _ in
+                    withAnimation(.easeOut(duration: 0.15)) {
+                        proxy.scrollTo(compactTextBottomID, anchor: .bottom)
+                    }
+                }
+                .onPreferenceChange(CompactTextSizePreferenceKey.self) { size in
+                    compactTextContentHeight = max(18, size.height)
+                    appState.updateMeasuredPreviewTextSize(size)
+                }
+            }
+            .font(.system(size: 14))
+            .multilineTextAlignment(.leading)
+            .truncationMode(.tail)
+            .frame(width: compactTextColumnWidth, alignment: .leading)
+        } else {
+            compactTextContent
+                .font(.system(size: 14))
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .frame(width: compactTextColumnWidth, alignment: .leading)
+        }
+    }
+
+    @ViewBuilder
+    private var compactTextContent: some View {
+        if case .done(let text) = appState.phase {
+            Text(text)
+                .foregroundStyle(.white)
+        } else if case .recording = appState.phase {
+            if appState.previewTranscript.isEmpty {
+                Text(L("Listening...", "聆听中..."))
+                    .foregroundStyle(.white.opacity(0.35))
+            } else {
+                Text(appState.previewTranscript)
+                    .foregroundStyle(.white.opacity(0.9))
+            }
+        } else if case .error = appState.phase {
+            Text(appState.phase.subtitle)
+                .foregroundStyle(.red.opacity(0.9))
+        } else {
+            Text(appState.phase.subtitle)
+                .foregroundStyle(.white.opacity(0.7))
+        }
+    }
+
+    private var shouldScrollCompactText: Bool {
+        switch appState.phase {
+        case .recording where !appState.previewTranscript.isEmpty:
+            return true
+        case .done, .error:
+            return true
+        default:
+            return false
+        }
+    }
+
+    private var compactTextColumnWidth: CGFloat {
+        let leadingIndicatorWidth: CGFloat
+        switch appState.phase {
+        case .recording, .transcribing, .updating:
+            leadingIndicatorWidth = 14
+        default:
+            leadingIndicatorWidth = 0
+        }
+
+        let trailingControlWidth: CGFloat
+        switch appState.phase {
+        case .recording:
+            trailingControlWidth = 56
+        case .error:
+            trailingControlWidth = 20
+        default:
+            trailingControlWidth = 0
+        }
+
+        return max(
+            160,
+            currentCompactPanelWidth - compactHorizontalPadding * 2 - leadingIndicatorWidth - trailingControlWidth - 16
         )
-        .shadow(color: .black.opacity(0.3), radius: 12, y: 4)
+    }
+
+    private var compactTextViewportHeight: CGFloat {
+        if case .recording = appState.phase {
+            return max(18, appState.overlayPreviewTextViewportHeight)
+        }
+
+        return max(
+            18,
+            CompactIslandMetrics.textViewportHeight(forContentHeight: compactTextContentHeight)
+        )
+    }
+
+    private var compactTextScrollKey: String {
+        switch appState.phase {
+        case .recording:
+            return appState.previewTranscript
+        default:
+            return appState.phase.subtitle
+        }
+    }
+
+    private var compactTextBottomID: String {
+        "compactTextBottom"
     }
 
     func permissionView(missing: Set<PermissionKind>) -> some View {
