@@ -111,15 +111,18 @@ jobs:
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release upload "$RELEASE_TAG" dist/TypeNo.dmg dist/TypeNo.app.zip --clobber
           else
-            TARGET_ARGS=()
             if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
-              TARGET_ARGS=(--target "$GITHUB_SHA")
+              gh release create "$RELEASE_TAG" \
+                dist/TypeNo.dmg \
+                dist/TypeNo.app.zip \
+                --title "TypeNo ${RELEASE_TAG}" \
+                --notes "$NOTES" \
+                --target "$GITHUB_SHA"
+            else
+              gh release create "$RELEASE_TAG" \
+                dist/TypeNo.dmg \
+                dist/TypeNo.app.zip \
+                --title "TypeNo ${RELEASE_TAG}" \
+                --notes "$NOTES"
             fi
-
-            gh release create "$RELEASE_TAG" \
-              dist/TypeNo.dmg \
-              dist/TypeNo.app.zip \
-              --title "TypeNo ${RELEASE_TAG}" \
-              --notes "$NOTES" \
-              "${TARGET_ARGS[@]}"
           fi
