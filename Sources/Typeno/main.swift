@@ -4576,8 +4576,8 @@ struct OverlayView: View {
 // MARK: - Update Service
 
 final class UpdateService: @unchecked Sendable {
-    static let repoOwner = "marswaveai"
-    static let repoName = "TypeNo"
+    static let repoOwner = "musterkill007"
+    static let repoName = "TypeNo-new"
     static let assetName = "TypeNo.app.zip"
 
     struct ReleaseInfo {

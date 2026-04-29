@@ -36,13 +36,12 @@ TypeNo now uses a notch-attached overlay inspired by Dynamic Island:
 
 ### Option 1 — Download the App
 
-- [Download TypeNo for macOS](https://github.com/marswaveai/TypeNo/releases/latest)
-- Download the latest `TypeNo.app.zip`
-- Unzip it
-- Move `TypeNo.app` to `/Applications`
+- [Download TypeNo for macOS](https://github.com/musterkill007/TypeNo-new/releases/latest)
+- Download the latest `TypeNo.dmg` (recommended) or `TypeNo.app.zip`
+- Open the DMG and drag `TypeNo.app` to `/Applications`, or unzip `TypeNo.app.zip`
 - Open TypeNo
 
-TypeNo is signed and notarized by Apple — it should open without any warnings.
+For public distribution, signed and notarized release assets are recommended so macOS can open the app without extra Gatekeeper steps.
 
 ### Install the speech engine
 
@@ -94,13 +93,24 @@ Some users find that enabling TypeNo in **System Settings → Privacy & Security
 ### Option 2 — Build from Source
 
 ```bash
-git clone https://github.com/marswaveai/TypeNo.git
-cd TypeNo
+git clone https://github.com/musterkill007/TypeNo-new.git
+cd TypeNo-new
 scripts/generate_icon.sh
 scripts/build_app.sh
 ```
 
 The app will be at `dist/TypeNo.app`. Move it to `/Applications/` for persistent permissions.
+
+### Maintainer Release
+
+To publish downloadable packages, push a version tag:
+
+```bash
+git tag v1.5.0
+git push origin v1.5.0
+```
+
+GitHub Actions will build and attach both `TypeNo.dmg` and `TypeNo.app.zip` to the release.
 
 ## Usage
 
@@ -122,7 +132,7 @@ TypeNo does one thing: voice → text → paste. No extra UI, no preferences, no
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=marswaveai/TypeNo&type=Date)](https://star-history.com/#marswaveai/TypeNo&Date)
+[![Star History Chart](https://api.star-history.com/svg?repos=musterkill007/TypeNo-new&type=Date)](https://star-history.com/#musterkill007/TypeNo-new&Date)
 
 ## License
 

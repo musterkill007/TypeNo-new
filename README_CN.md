@@ -36,12 +36,12 @@ TypeNo 现在使用贴合 Mac 刘海的灵动岛式悬浮层：
 
 ### 方式一：直接下载
 
-- [下载 TypeNo for macOS](https://github.com/marswaveai/TypeNo/releases/latest)
-- 下载最新的 `TypeNo.app.zip`
-- 解压后将 `TypeNo.app` 拖到 `/Applications`
+- [下载 TypeNo for macOS](https://github.com/musterkill007/TypeNo-new/releases/latest)
+- 下载最新的 `TypeNo.dmg`（推荐）或 `TypeNo.app.zip`
+- 打开 DMG 并将 `TypeNo.app` 拖到 `/Applications`，或者解压 `TypeNo.app.zip`
 - 打开 TypeNo
 
-TypeNo 已通过 Apple 签名和公证，可以直接打开使用。
+面向公开分发时，建议发布经过 Apple 签名和公证的安装包，这样 macOS 可以直接打开，减少 Gatekeeper 提示。
 
 ### 安装语音识别引擎
 
@@ -93,13 +93,24 @@ npm install -g @marswave/coli
 ### 方式二：从源码构建
 
 ```bash
-git clone https://github.com/marswaveai/TypeNo.git
-cd TypeNo
+git clone https://github.com/musterkill007/TypeNo-new.git
+cd TypeNo-new
 scripts/generate_icon.sh
 scripts/build_app.sh
 ```
 
 应用位于 `dist/TypeNo.app`。移动到 `/Applications/` 以获得持久权限。
+
+### 维护者发布
+
+发布可下载安装包时，推送版本 tag：
+
+```bash
+git tag v1.5.0
+git push origin v1.5.0
+```
+
+GitHub Actions 会自动构建，并将 `TypeNo.dmg` 和 `TypeNo.app.zip` 上传到 Release。
 
 ## 操作方式
 
@@ -121,7 +132,7 @@ TypeNo 只做一件事：语音 → 文字 → 粘贴。没有多余的 UI，没
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=marswaveai/TypeNo&type=Date)](https://star-history.com/#marswaveai/TypeNo&Date)
+[![Star History Chart](https://api.star-history.com/svg?repos=musterkill007/TypeNo-new&type=Date)](https://star-history.com/#musterkill007/TypeNo-new&Date)
 
 ## 许可证
 
