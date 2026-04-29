@@ -43,19 +43,24 @@ TypeNo now uses a notch-attached overlay inspired by Dynamic Island:
 
 For public distribution, signed and notarized release assets are recommended so macOS can open the app without extra Gatekeeper steps.
 
-### Install the speech engine
+### Speech Engine Setup
 
 TypeNo uses [coli](https://github.com/marswaveai/coli) for local speech recognition.
 
-**Prerequisites:**
-- [Node.js](https://nodejs.org) (LTS recommended — install directly from nodejs.org for best compatibility)
-- [ffmpeg](https://ffmpeg.org) — required for audio conversion: `brew install ffmpeg`
+On first launch, TypeNo checks the local speech dependencies:
+
+- [Node.js](https://nodejs.org) / npm — required to install and run coli
+- [ffmpeg](https://ffmpeg.org) — required for audio conversion
+- [coli](https://github.com/marswaveai/coli) — the local ASR engine
+
+If something is missing, TypeNo shows an in-app setup guide before recording starts. It can install `ffmpeg` automatically when Homebrew is available, and it can install `coli` automatically once npm and ffmpeg are ready. If Node.js or Homebrew is missing, the guide offers install links and a copyable command set.
+
+Manual setup is still supported:
 
 ```bash
+brew install ffmpeg
 npm install -g @marswave/coli
 ```
-
-If Coli is missing, TypeNo will show an in-app setup prompt with the install command.
 
 > **Node 24+:** If you get a `sherpa-onnx-node` error, build from source:
 > ```bash
@@ -106,8 +111,8 @@ The app will be at `dist/TypeNo.app`. Move it to `/Applications/` for persistent
 To publish downloadable packages, push a version tag:
 
 ```bash
-git tag v1.5.0
-git push origin v1.5.0
+git tag v1.5.1
+git push origin v1.5.1
 ```
 
 GitHub Actions will build and attach both `TypeNo.dmg` and `TypeNo.app.zip` to the release.

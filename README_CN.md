@@ -43,19 +43,24 @@ TypeNo 现在使用贴合 Mac 刘海的灵动岛式悬浮层：
 
 面向公开分发时，建议发布经过 Apple 签名和公证的安装包，这样 macOS 可以直接打开，减少 Gatekeeper 提示。
 
-### 安装语音识别引擎
+### 语音识别引擎设置
 
 TypeNo 使用 [coli](https://github.com/marswaveai/coli) 进行本地语音识别。
 
-**前置依赖：**
-- [Node.js](https://nodejs.org)（推荐 LTS 版本，直接从 nodejs.org 安装兼容性最好）
-- [ffmpeg](https://ffmpeg.org) — 音频转换必需：`brew install ffmpeg`
+首次启动时，TypeNo 会自动检查本地语音依赖：
+
+- [Node.js](https://nodejs.org) / npm — 用于安装和运行 coli
+- [ffmpeg](https://ffmpeg.org) — 用于音频转换
+- [coli](https://github.com/marswaveai/coli) — 本地语音识别引擎
+
+如果依赖缺失，TypeNo 会在录制前弹出应用内设置向导。检测到 Homebrew 时，应用可以自动安装 `ffmpeg`；npm 和 ffmpeg 就绪后，也可以自动安装 `coli`。如果缺少 Node.js 或 Homebrew，向导会提供安装链接和一键复制的命令。
+
+仍然可以手动安装：
 
 ```bash
+brew install ffmpeg
 npm install -g @marswave/coli
 ```
-
-如果未安装 Coli，TypeNo 会在应用内弹出引导提示。
 
 > **Node 24+：** 如果遇到 `sherpa-onnx-node` 错误，请从源码编译安装：
 > ```bash
@@ -106,8 +111,8 @@ scripts/build_app.sh
 发布可下载安装包时，推送版本 tag：
 
 ```bash
-git tag v1.5.0
-git push origin v1.5.0
+git tag v1.5.1
+git push origin v1.5.1
 ```
 
 GitHub Actions 会自动构建，并将 `TypeNo.dmg` 和 `TypeNo.app.zip` 上传到 Release。

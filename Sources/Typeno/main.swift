@@ -252,6 +252,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         seedDebugHistoryIfNeeded()
         startDebugAutoRecordingIfNeeded()
+        showDependencyGuideIfNeeded()
 
         // Silent update check on launch
         Task {
@@ -321,6 +322,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    private func showDependencyGuideIfNeeded() {
+        let environment = ProcessInfo.processInfo.environment
+        let hasDebugOverlay = environment["TYPENO_DEBUG_PREVIEW_TEXT"] != nil
+            || environment["TYPENO_DEBUG_SEED_HISTORY"] == "1"
+            || environment["TYPENO_DEBUG_AUTO_RECORD"] == "1"
+        guard !hasDebugOverlay else { return }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) { [weak self] in
+            self?.appState.showDependencyGuideIfNeeded()
+        }
+    }
+
     @objc private func workspaceContextDidChange(_ notification: Notification) {
         refreshFullscreenIdleIslandSuppression()
     }
@@ -348,10 +361,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 appState.showPermissions(missing)
             }
         case .missingColi:
-            if ColiASRService.isInstalled {
+            let dependencyStatus = appState.refreshDependencyStatus()
+            if dependencyStatus.isReady {
                 appState.hideColiGuidance()
-            } else if ColiASRService.isNpmAvailable {
-                // npm became available (user installed Node), trigger auto-install
+            } else if dependencyStatus.canAutoInstallFFmpeg && !appState.autoInstallBlocked(for: .ffmpeg) {
+                appState.autoInstallFFmpeg()
+            } else if dependencyStatus.canAutoInstallColi && !appState.autoInstallBlocked(for: .coli) {
                 appState.autoInstallColi()
             }
         default:
@@ -395,7 +410,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             permissionsGranted = true
         }
 
-        guard ColiASRService.isInstalled else {
+        guard appState.refreshDependencyStatus().isReady else {
             appState.showMissingColi()
             return
         }
@@ -590,6 +605,115 @@ enum AppPhase: Equatable {
     }
 }
 
+enum DependencyID: CaseIterable, Hashable, Identifiable {
+    case node
+    case ffmpeg
+    case coli
+
+    var id: Self { self }
+
+    var title: String {
+        switch self {
+        case .node: "Node.js / npm"
+        case .ffmpeg: "ffmpeg"
+        case .coli: "coli"
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .node: "hexagon"
+        case .ffmpeg: "waveform"
+        case .coli: "brain.head.profile"
+        }
+    }
+}
+
+struct DependencyStatus: Equatable {
+    var nodePath: String?
+    var npmPath: String?
+    var ffmpegPath: String?
+    var brewPath: String?
+    var coliPath: String?
+
+    static func detect() -> DependencyStatus {
+        DependencyStatus(
+            nodePath: ColiASRService.findNodePath(),
+            npmPath: ColiASRService.findNpmPath(),
+            ffmpegPath: ColiASRService.findFFmpegPath(),
+            brewPath: ColiASRService.findBrewPath(),
+            coliPath: ColiASRService.findPreviewCapableColiPath()
+        )
+    }
+
+    var isReady: Bool {
+        npmPath != nil && ffmpegPath != nil && coliPath != nil
+    }
+
+    var missingDependencies: [DependencyID] {
+        DependencyID.allCases.filter { !isReady($0) }
+    }
+
+    var canAutoInstallFFmpeg: Bool {
+        ffmpegPath == nil && brewPath != nil
+    }
+
+    var canAutoInstallColi: Bool {
+        npmPath != nil && ffmpegPath != nil && coliPath == nil
+    }
+
+    func isReady(_ dependency: DependencyID) -> Bool {
+        switch dependency {
+        case .node: npmPath != nil
+        case .ffmpeg: ffmpegPath != nil
+        case .coli: coliPath != nil
+        }
+    }
+
+    func detail(for dependency: DependencyID) -> String {
+        switch dependency {
+        case .node:
+            if let npmPath {
+                return L("Found npm at \(npmPath)", "已找到 npm：\(npmPath)")
+            }
+            return L("Install Node.js first so TypeNo can use npm.", "请先安装 Node.js，TypeNo 才能使用 npm。")
+        case .ffmpeg:
+            if let ffmpegPath {
+                return L("Found ffmpeg at \(ffmpegPath)", "已找到 ffmpeg：\(ffmpegPath)")
+            }
+            if brewPath != nil {
+                return L("TypeNo can install ffmpeg with Homebrew.", "TypeNo 可以通过 Homebrew 安装 ffmpeg。")
+            }
+            return L("Install Homebrew, then run brew install ffmpeg.", "请先安装 Homebrew，然后执行 brew install ffmpeg。")
+        case .coli:
+            if let coliPath {
+                return L("Found coli at \(coliPath)", "已找到 coli：\(coliPath)")
+            }
+            if npmPath != nil && ffmpegPath != nil {
+                return L("TypeNo can install coli automatically with npm.", "TypeNo 可以通过 npm 自动安装 coli。")
+            }
+            return L("coli will be installed after Node.js and ffmpeg are ready.", "Node.js 和 ffmpeg 准备好后会安装 coli。")
+        }
+    }
+
+    var setupCommands: [String] {
+        var commands: [String] = []
+        if npmPath == nil {
+            commands.append("# Install Node.js from https://nodejs.org")
+        }
+        if ffmpegPath == nil {
+            if brewPath == nil {
+                commands.append("# Install Homebrew from https://brew.sh")
+            }
+            commands.append("brew install ffmpeg")
+        }
+        if coliPath == nil {
+            commands.append("npm install -g @marswave/coli")
+        }
+        return commands
+    }
+}
+
 struct PreviewStreamPayload: Sendable {
     let data: Data
     let isFinal: Bool
@@ -642,6 +766,8 @@ final class AppState: ObservableObject {
     @Published var overlayPreviewTextViewportHeight: CGFloat = 18
     @Published var overlayHistoryRowsViewportHeight: CGFloat = 26
     @Published var overlayLayoutPlan: OverlayLayoutPlan?
+    @Published var dependencyStatus = DependencyStatus.detect()
+    @Published var dependencyErrorMessage: String?
 
     var onOverlayRequest: ((Bool) -> Void)?
     var onPermissionOpen: ((PermissionKind) -> Void)?
@@ -667,6 +793,7 @@ final class AppState: ObservableObject {
     private let previewAudioGate = PreviewAudioGate()
     private var measuredPreviewTextSize: CGSize = CGSize(width: 0, height: 18)
     private var measuredHistoryRowSizes: [UUID: CGSize] = [:]
+    private var blockedAutoInstallDependencies = Set<DependencyID>()
     @Published var recordingElapsedSeconds: Int = 0
 
     var recordingElapsedStr: String {
@@ -773,9 +900,46 @@ final class AppState: ObservableObject {
         onOverlayRequest?(shouldShowIdleIsland)
     }
 
-    func showMissingColi() {
-        // If npm is available, auto-install coli instead of showing manual guidance
-        if ColiASRService.isNpmAvailable {
+    @discardableResult
+    func refreshDependencyStatus() -> DependencyStatus {
+        let nextStatus = DependencyStatus.detect()
+        dependencyStatus = nextStatus
+        for dependency in DependencyID.allCases where nextStatus.isReady(dependency) {
+            blockedAutoInstallDependencies.remove(dependency)
+        }
+        if nextStatus.isReady {
+            dependencyErrorMessage = nil
+        }
+        return nextStatus
+    }
+
+    func autoInstallBlocked(for dependency: DependencyID) -> Bool {
+        blockedAutoInstallDependencies.contains(dependency)
+    }
+
+    func showDependencyGuideIfNeeded() {
+        guard case .idle = phase else { return }
+        let status = refreshDependencyStatus()
+        guard !status.isReady else { return }
+        phase = .missingColi
+        onOverlayRequest?(true)
+    }
+
+    func showMissingColi(allowAutoInstall: Bool = true) {
+        let status = refreshDependencyStatus()
+        guard !status.isReady else {
+            phase = .idle
+            onOverlayRequest?(shouldShowIdleIsland)
+            return
+        }
+
+        if allowAutoInstall,
+           status.canAutoInstallFFmpeg,
+           !blockedAutoInstallDependencies.contains(.ffmpeg) {
+            autoInstallFFmpeg()
+        } else if allowAutoInstall,
+                  status.canAutoInstallColi,
+                  !blockedAutoInstallDependencies.contains(.coli) {
             autoInstallColi()
         } else {
             phase = .missingColi
@@ -784,7 +948,8 @@ final class AppState: ObservableObject {
     }
 
     func autoInstallColi() {
-        phase = .installingColi(L("Installing coli...", "安装中..."))
+        dependencyErrorMessage = nil
+        phase = .installingColi(L("Installing coli with npm...", "正在通过 npm 安装 coli..."))
         onOverlayRequest?(true)
 
         Task {
@@ -793,17 +958,51 @@ final class AppState: ObservableObject {
                     self?.phase = .installingColi(message)
                 }
                 // Verify installation
-                if ColiASRService.isInstalled {
+                let status = refreshDependencyStatus()
+                if status.isReady {
                     phase = .idle
                     onOverlayRequest?(shouldShowIdleIsland)
                 } else {
-                    // Fallback to manual guidance
-                    phase = .missingColi
+                    showMissingColi(allowAutoInstall: false)
                 }
             } catch {
-                showError("Install failed: \(error.localizedDescription)")
+                blockedAutoInstallDependencies.insert(.coli)
+                dependencyErrorMessage = L(
+                    "Could not install coli automatically: \(error.localizedDescription)",
+                    "无法自动安装 coli：\(error.localizedDescription)"
+                )
+                showMissingColi(allowAutoInstall: false)
             }
         }
+    }
+
+    func autoInstallFFmpeg() {
+        dependencyErrorMessage = nil
+        phase = .installingColi(L("Installing ffmpeg with Homebrew...", "正在通过 Homebrew 安装 ffmpeg..."))
+        onOverlayRequest?(true)
+
+        Task {
+            do {
+                try await ColiASRService.installFFmpeg { [weak self] message in
+                    self?.phase = .installingColi(message)
+                }
+                showMissingColi()
+            } catch {
+                blockedAutoInstallDependencies.insert(.ffmpeg)
+                dependencyErrorMessage = L(
+                    "Could not install ffmpeg automatically: \(error.localizedDescription)",
+                    "无法自动安装 ffmpeg：\(error.localizedDescription)"
+                )
+                showMissingColi(allowAutoInstall: false)
+            }
+        }
+    }
+
+    func copyDependencySetupCommands() {
+        let commands = dependencyStatus.setupCommands.joined(separator: "\n")
+        guard !commands.isEmpty else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(commands, forType: .string)
     }
 
     func hideColiGuidance() {
@@ -1345,6 +1544,7 @@ enum TypeNoError: LocalizedError {
     case coliNotInstalled
     case npmNotFound
     case coliInstallFailed(String)
+    case dependencyInstallFailed(String)
     case transcriptionFailed(String)
     case noMicrophoneAvailable
     case selectedMicrophoneUnavailable
@@ -1358,6 +1558,7 @@ enum TypeNoError: LocalizedError {
         case .coliNotInstalled: "TypeNo needs the local Coli engine. Install it with: npm install -g @marswave/coli"
         case .npmNotFound: "Node.js is required. Install it from https://nodejs.org"
         case .coliInstallFailed(let message): "Coli install failed: \(message)"
+        case .dependencyInstallFailed(let message): message
         case .transcriptionFailed(let message): message
         case .noMicrophoneAvailable: L("No microphone available", "没有可用的麦克风")
         case .selectedMicrophoneUnavailable: L("The selected microphone is unavailable", "所选麦克风当前不可用")
@@ -1839,6 +2040,10 @@ final class ColiASRService: @unchecked Sendable {
         findNpmPath() != nil
     }
 
+    static var dependenciesAreReady: Bool {
+        DependencyStatus.detect().isReady
+    }
+
     private struct PreviewState {
         var process: Process
         var stdin: FileHandle
@@ -1909,6 +2114,82 @@ final class ColiASRService: @unchecked Sendable {
                         let errorOutput = String(data: stderrBuf.read(), encoding: .utf8) ?? ""
                         let msg = errorOutput.trimmingCharacters(in: .whitespacesAndNewlines)
                         throw TypeNoError.coliInstallFailed(msg.isEmpty ? "npm install failed" : msg)
+                    }
+
+                    continuation.resume()
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    static func installFFmpeg(onProgress: @MainActor @Sendable @escaping (String) -> Void) async throws {
+        guard let brewPath = findBrewPath() else {
+            throw TypeNoError.dependencyInstallFailed("Homebrew is required to install ffmpeg automatically.")
+        }
+
+        await onProgress(L("Installing ffmpeg with Homebrew...", "正在通过 Homebrew 安装 ffmpeg..."))
+
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            DispatchQueue.global(qos: .utility).async {
+                do {
+                    let process = Process()
+                    process.executableURL = URL(fileURLWithPath: brewPath)
+                    process.arguments = ["install", "ffmpeg"]
+
+                    var processEnv = ProcessInfo.processInfo.environment
+                    let brewDir = (brewPath as NSString).deletingLastPathComponent
+                    let existingPath = processEnv["PATH"] ?? "/usr/bin:/bin"
+                    processEnv["PATH"] = [
+                        brewDir,
+                        "/opt/homebrew/bin",
+                        "/usr/local/bin",
+                        existingPath
+                    ].joined(separator: ":")
+                    process.environment = processEnv
+
+                    let stdout = Pipe()
+                    let stderr = Pipe()
+                    process.standardOutput = stdout
+                    process.standardError = stderr
+
+                    let stdoutBuf = LockedData()
+                    let stderrBuf = LockedData()
+                    let stdoutHandle = stdout.fileHandleForReading
+                    let stderrHandle = stderr.fileHandleForReading
+
+                    stdoutHandle.readabilityHandler = { handle in
+                        let data = handle.availableData
+                        if !data.isEmpty { stdoutBuf.append(data) }
+                    }
+                    stderrHandle.readabilityHandler = { handle in
+                        let data = handle.availableData
+                        if !data.isEmpty { stderrBuf.append(data) }
+                    }
+
+                    try process.run()
+
+                    let timeoutItem = DispatchWorkItem {
+                        if process.isRunning { process.terminate() }
+                    }
+                    DispatchQueue.global().asyncAfter(deadline: .now() + 900, execute: timeoutItem)
+
+                    process.waitUntilExit()
+                    timeoutItem.cancel()
+
+                    stdoutHandle.readabilityHandler = nil
+                    stderrHandle.readabilityHandler = nil
+
+                    guard process.terminationStatus == 0 else {
+                        let output = [
+                            String(data: stdoutBuf.read(), encoding: .utf8),
+                            String(data: stderrBuf.read(), encoding: .utf8)
+                        ]
+                            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+                            .filter { !$0.isEmpty }
+                            .joined(separator: "\n")
+                        throw TypeNoError.dependencyInstallFailed(output.isEmpty ? "brew install ffmpeg failed" : output)
                     }
 
                     continuation.resume()
@@ -2383,7 +2664,72 @@ final class ColiASRService: @unchecked Sendable {
         return resolveViaShell("npm")
     }
 
-    private static func findColiPath() -> String? {
+    static func findNodePath() -> String? {
+        let env = ProcessInfo.processInfo.environment
+        let home = env["HOME"] ?? ""
+
+        if let pathInEnv = executableInPath(named: "node", path: env["PATH"]) {
+            return pathInEnv
+        }
+
+        let candidates = [
+            "/opt/homebrew/bin/node",
+            "/usr/local/bin/node",
+            home + "/.nvm/current/bin/node",
+            home + "/.volta/bin/node",
+            home + "/.local/share/fnm/aliases/default/bin/node",
+            home + "/.bun/bin/node",
+            "/opt/homebrew/opt/node/bin/node"
+        ]
+
+        if let found = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) {
+            return found
+        }
+
+        return resolveViaShell("node")
+    }
+
+    static func findFFmpegPath() -> String? {
+        let env = ProcessInfo.processInfo.environment
+
+        if let pathInEnv = executableInPath(named: "ffmpeg", path: env["PATH"]) {
+            return pathInEnv
+        }
+
+        let candidates = [
+            "/opt/homebrew/bin/ffmpeg",
+            "/usr/local/bin/ffmpeg",
+            "/opt/homebrew/opt/ffmpeg/bin/ffmpeg",
+            "/usr/local/opt/ffmpeg/bin/ffmpeg"
+        ]
+
+        if let found = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) {
+            return found
+        }
+
+        return resolveViaShell("ffmpeg")
+    }
+
+    static func findBrewPath() -> String? {
+        let env = ProcessInfo.processInfo.environment
+
+        if let pathInEnv = executableInPath(named: "brew", path: env["PATH"]) {
+            return pathInEnv
+        }
+
+        let candidates = [
+            "/opt/homebrew/bin/brew",
+            "/usr/local/bin/brew"
+        ]
+
+        if let found = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) {
+            return found
+        }
+
+        return resolveViaShell("brew")
+    }
+
+    static func findColiPath() -> String? {
         let env = ProcessInfo.processInfo.environment
         let home = env["HOME"] ?? ""
 
@@ -2430,7 +2776,7 @@ final class ColiASRService: @unchecked Sendable {
         return resolveViaShell("coli")
     }
 
-    private static func findPreviewCapableColiPath() -> String? {
+    static func findPreviewCapableColiPath() -> String? {
         guard let coliPath = findColiPath() else {
             return nil
         }
@@ -4487,7 +4833,8 @@ struct OverlayView: View {
     }
 
     var missingColiView: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        let status = appState.dependencyStatus
+        return VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 12) {
                 Image(systemName: "exclamationmark.triangle")
                     .font(.system(size: 16))
@@ -4495,9 +4842,9 @@ struct OverlayView: View {
                     .frame(width: 24)
 
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(L("Node.js Required", "需要 Node.js"))
+                    Text(L("Finish setup", "完成依赖配置"))
                         .font(.system(size: 13, weight: .medium))
-                    Text(L("Install Node.js first, then TypeNo will set up automatically.", "请先安装 Node.js，TypeNo 将自动配置。"))
+                    Text(L("TypeNo checks Node.js, ffmpeg, and coli before recording.", "TypeNo 会在录制前检查 Node.js、ffmpeg 和 coli。"))
                         .font(.system(size: 11))
                         .foregroundStyle(.secondary)
                 }
@@ -4505,29 +4852,57 @@ struct OverlayView: View {
                 Spacer()
             }
 
-            HStack(spacing: 8) {
-                Text("https://nodejs.org")
-                    .font(.system(size: 11, design: .monospaced))
-                    .foregroundStyle(.secondary)
-                    .padding(.leading, 36)
-
-                Button(action: {
-                    if let url = URL(string: "https://nodejs.org") {
-                        NSWorkspace.shared.open(url)
-                    }
-                }) {
-                    Image(systemName: "arrow.up.right.square")
-                        .font(.system(size: 10))
+            VStack(alignment: .leading, spacing: 8) {
+                ForEach(DependencyID.allCases) { dependency in
+                    dependencyRow(dependency, status: status)
                 }
-                .buttonStyle(.borderless)
-                .help("Open nodejs.org")
+            }
+            .padding(.leading, 2)
+
+            if let errorMessage = appState.dependencyErrorMessage {
+                Text(errorMessage)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.red.opacity(0.85))
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.leading, 2)
             }
 
-            HStack {
-                Text(L("Checking automatically...", "自动检测中..."))
-                    .font(.system(size: 11))
-                    .foregroundStyle(.tertiary)
+            HStack(spacing: 8) {
+                if status.npmPath == nil {
+                    Button(L("Open Node.js", "打开 Node.js")) {
+                        if let url = URL(string: "https://nodejs.org") {
+                            NSWorkspace.shared.open(url)
+                        }
+                    }
+                    .buttonStyle(.borderless)
+                    .font(.system(size: 12))
+                }
+
+                if status.canAutoInstallFFmpeg && !appState.autoInstallBlocked(for: .ffmpeg) {
+                    Button(L("Install ffmpeg", "安装 ffmpeg")) {
+                        appState.autoInstallFFmpeg()
+                    }
+                    .buttonStyle(.borderless)
+                    .font(.system(size: 12))
+                }
+
+                if status.canAutoInstallColi && !appState.autoInstallBlocked(for: .coli) {
+                    Button(L("Install coli", "安装 coli")) {
+                        appState.autoInstallColi()
+                    }
+                    .buttonStyle(.borderless)
+                    .font(.system(size: 12))
+                }
+
+                Button(L("Copy commands", "复制命令")) {
+                    appState.copyDependencySetupCommands()
+                }
+                .buttonStyle(.borderless)
+                .font(.system(size: 12))
+                .disabled(status.setupCommands.isEmpty)
+
                 Spacer()
+
                 Button(L("Cancel", "取消")) {
                     appState.onCancel?()
                 }
@@ -4543,6 +4918,29 @@ struct OverlayView: View {
             RoundedRectangle(cornerRadius: 12, style: .continuous)
                 .strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5)
         )
+    }
+
+    private func dependencyRow(_ dependency: DependencyID, status: DependencyStatus) -> some View {
+        let ready = status.isReady(dependency)
+
+        return HStack(alignment: .top, spacing: 8) {
+            Image(systemName: ready ? "checkmark.circle.fill" : dependency.icon)
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(ready ? .green : .secondary)
+                .frame(width: 18)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(dependency.title)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.primary.opacity(0.9))
+
+                Text(status.detail(for: dependency))
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
     }
 
     func installingColiView(message: String) -> some View {
