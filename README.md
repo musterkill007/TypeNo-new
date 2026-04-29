@@ -52,8 +52,9 @@ On first launch, TypeNo checks the local speech dependencies:
 - [Node.js](https://nodejs.org) / npm — required to install and run coli
 - [ffmpeg](https://ffmpeg.org) — required for audio conversion
 - [coli](https://github.com/marswaveai/coli) — the local ASR engine
+- SenseVoice speech model — downloaded by coli on first use, about 230 MB
 
-If something is missing, TypeNo shows an in-app setup guide before recording starts. It can install `ffmpeg` automatically when Homebrew is available, and it can install `coli` automatically once npm and ffmpeg are ready. If Node.js or Homebrew is missing, the guide offers install links and a copyable command set.
+If something is missing, TypeNo shows an in-app setup guide before recording starts. It can install `ffmpeg` automatically when Homebrew is available, install `coli` automatically once npm and ffmpeg are ready, and pre-download the first-run SenseVoice model so the first recording does not get stuck on a model download. If Node.js or Homebrew is missing, the guide offers install links and a copyable command set.
 
 Manual setup is still supported:
 
@@ -111,8 +112,8 @@ The app will be at `dist/TypeNo.app`. Move it to `/Applications/` for persistent
 To publish downloadable packages, push a version tag:
 
 ```bash
-git tag v1.5.1
-git push origin v1.5.1
+git tag v1.5.2
+git push origin v1.5.2
 ```
 
 GitHub Actions will build and attach both `TypeNo.dmg` and `TypeNo.app.zip` to the release.

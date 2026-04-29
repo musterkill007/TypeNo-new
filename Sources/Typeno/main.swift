@@ -368,6 +368,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 appState.autoInstallFFmpeg()
             } else if dependencyStatus.canAutoInstallColi && !appState.autoInstallBlocked(for: .coli) {
                 appState.autoInstallColi()
+            } else if dependencyStatus.canAutoInstallSpeechModel && !appState.autoInstallBlocked(for: .speechModel) {
+                appState.autoInstallSpeechModel()
             }
         default:
             break
@@ -609,6 +611,7 @@ enum DependencyID: CaseIterable, Hashable, Identifiable {
     case node
     case ffmpeg
     case coli
+    case speechModel
 
     var id: Self { self }
 
@@ -617,6 +620,7 @@ enum DependencyID: CaseIterable, Hashable, Identifiable {
         case .node: "Node.js / npm"
         case .ffmpeg: "ffmpeg"
         case .coli: "coli"
+        case .speechModel: L("Speech model", "语音模型")
         }
     }
 
@@ -625,6 +629,7 @@ enum DependencyID: CaseIterable, Hashable, Identifiable {
         case .node: "hexagon"
         case .ffmpeg: "waveform"
         case .coli: "brain.head.profile"
+        case .speechModel: "square.and.arrow.down"
         }
     }
 }
@@ -635,6 +640,8 @@ struct DependencyStatus: Equatable {
     var ffmpegPath: String?
     var brewPath: String?
     var coliPath: String?
+    var speechModelPath: String?
+    var speechModelIssue: String?
 
     static func detect() -> DependencyStatus {
         DependencyStatus(
@@ -642,12 +649,14 @@ struct DependencyStatus: Equatable {
             npmPath: ColiASRService.findNpmPath(),
             ffmpegPath: ColiASRService.findFFmpegPath(),
             brewPath: ColiASRService.findBrewPath(),
-            coliPath: ColiASRService.findPreviewCapableColiPath()
+            coliPath: ColiASRService.findPreviewCapableColiPath(),
+            speechModelPath: ColiASRService.findSenseVoiceModelPath(),
+            speechModelIssue: ColiASRService.detectIncompleteModelDownload()
         )
     }
 
     var isReady: Bool {
-        npmPath != nil && ffmpegPath != nil && coliPath != nil
+        npmPath != nil && ffmpegPath != nil && coliPath != nil && speechModelPath != nil
     }
 
     var missingDependencies: [DependencyID] {
@@ -662,11 +671,16 @@ struct DependencyStatus: Equatable {
         npmPath != nil && ffmpegPath != nil && coliPath == nil
     }
 
+    var canAutoInstallSpeechModel: Bool {
+        ffmpegPath != nil && coliPath != nil && speechModelPath == nil
+    }
+
     func isReady(_ dependency: DependencyID) -> Bool {
         switch dependency {
         case .node: npmPath != nil
         case .ffmpeg: ffmpegPath != nil
         case .coli: coliPath != nil
+        case .speechModel: speechModelPath != nil
         }
     }
 
@@ -693,6 +707,17 @@ struct DependencyStatus: Equatable {
                 return L("TypeNo can install coli automatically with npm.", "TypeNo 可以通过 npm 自动安装 coli。")
             }
             return L("coli will be installed after Node.js and ffmpeg are ready.", "Node.js 和 ffmpeg 准备好后会安装 coli。")
+        case .speechModel:
+            if let speechModelPath {
+                return L("Found SenseVoice model at \(speechModelPath)", "已找到 SenseVoice 模型：\(speechModelPath)")
+            }
+            if let speechModelIssue {
+                return speechModelIssue
+            }
+            if coliPath != nil && ffmpegPath != nil {
+                return L("TypeNo can download the first-run SenseVoice model now.", "TypeNo 可以现在下载首次使用所需的 SenseVoice 模型。")
+            }
+            return L("The model will download after ffmpeg and coli are ready.", "ffmpeg 和 coli 准备好后会下载模型。")
         }
     }
 
@@ -709,6 +734,9 @@ struct DependencyStatus: Equatable {
         }
         if coliPath == nil {
             commands.append("npm install -g @marswave/coli")
+        }
+        if speechModelPath == nil {
+            commands.append("# The SenseVoice model downloads automatically during TypeNo setup or the first coli transcription.")
         }
         return commands
     }
@@ -941,6 +969,10 @@ final class AppState: ObservableObject {
                   status.canAutoInstallColi,
                   !blockedAutoInstallDependencies.contains(.coli) {
             autoInstallColi()
+        } else if allowAutoInstall,
+                  status.canAutoInstallSpeechModel,
+                  !blockedAutoInstallDependencies.contains(.speechModel) {
+            autoInstallSpeechModel()
         } else {
             phase = .missingColi
             onOverlayRequest?(true)
@@ -963,7 +995,7 @@ final class AppState: ObservableObject {
                     phase = .idle
                     onOverlayRequest?(shouldShowIdleIsland)
                 } else {
-                    showMissingColi(allowAutoInstall: false)
+                    showMissingColi()
                 }
             } catch {
                 blockedAutoInstallDependencies.insert(.coli)
@@ -992,6 +1024,34 @@ final class AppState: ObservableObject {
                 dependencyErrorMessage = L(
                     "Could not install ffmpeg automatically: \(error.localizedDescription)",
                     "无法自动安装 ffmpeg：\(error.localizedDescription)"
+                )
+                showMissingColi(allowAutoInstall: false)
+            }
+        }
+    }
+
+    func autoInstallSpeechModel() {
+        dependencyErrorMessage = nil
+        phase = .installingColi(L("Downloading SenseVoice model...", "正在下载 SenseVoice 语音模型..."))
+        onOverlayRequest?(true)
+
+        Task {
+            do {
+                try await ColiASRService.prepareSpeechModel { [weak self] message in
+                    self?.phase = .installingColi(message)
+                }
+                let status = refreshDependencyStatus()
+                if status.isReady {
+                    phase = .idle
+                    onOverlayRequest?(shouldShowIdleIsland)
+                } else {
+                    showMissingColi(allowAutoInstall: false)
+                }
+            } catch {
+                blockedAutoInstallDependencies.insert(.speechModel)
+                dependencyErrorMessage = L(
+                    "Could not download the speech model automatically: \(error.localizedDescription)",
+                    "无法自动下载语音模型：\(error.localizedDescription)"
                 )
                 showMissingColi(allowAutoInstall: false)
             }
@@ -2029,6 +2089,7 @@ private final class LockedData: @unchecked Sendable {
 }
 
 final class ColiASRService: @unchecked Sendable {
+    static let senseVoiceModelName = "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17"
     private static let previewCapabilityLock = NSLock()
     nonisolated(unsafe) private static var previewCapabilityCache: (path: String, supported: Bool)?
 
@@ -2194,6 +2255,101 @@ final class ColiASRService: @unchecked Sendable {
 
                     continuation.resume()
                 } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    static func prepareSpeechModel(onProgress: @MainActor @Sendable @escaping (String) -> Void) async throws {
+        if findSenseVoiceModelPath() != nil {
+            await onProgress(L("Speech model is ready.", "语音模型已就绪。"))
+            return
+        }
+        if let modelIssue = detectIncompleteModelDownload() {
+            throw TypeNoError.dependencyInstallFailed(modelIssue)
+        }
+        guard let coliPath = findColiPath() else {
+            throw TypeNoError.coliNotInstalled
+        }
+        guard findFFmpegPath() != nil else {
+            throw TypeNoError.dependencyInstallFailed("ffmpeg is required before downloading the speech model.")
+        }
+
+        await onProgress(L("Downloading SenseVoice model... This may take a few minutes.", "正在下载 SenseVoice 语音模型，可能需要几分钟..."))
+
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            DispatchQueue.global(qos: .utility).async {
+                let workDir = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("typeno-model-prewarm-\(UUID().uuidString)", isDirectory: true)
+                do {
+                    try FileManager.default.createDirectory(at: workDir, withIntermediateDirectories: true)
+                    let warmupAudioURL = workDir.appendingPathComponent("warmup.wav")
+                    try writeSilentWarmupWav(to: warmupAudioURL)
+
+                    let process = Process()
+                    process.executableURL = URL(fileURLWithPath: coliPath)
+                    process.arguments = ["asr", warmupAudioURL.path]
+                    process.environment = makeColiEnvironment(coliPath: coliPath)
+
+                    let stdout = Pipe()
+                    let stderr = Pipe()
+                    process.standardOutput = stdout
+                    process.standardError = stderr
+
+                    let stdoutBuf = LockedData()
+                    let stderrBuf = LockedData()
+                    let stdoutHandle = stdout.fileHandleForReading
+                    let stderrHandle = stderr.fileHandleForReading
+
+                    stdoutHandle.readabilityHandler = { handle in
+                        let data = handle.availableData
+                        guard !data.isEmpty else { return }
+                        stdoutBuf.append(data)
+                        forwardModelDownloadProgress(data, to: onProgress)
+                    }
+                    stderrHandle.readabilityHandler = { handle in
+                        let data = handle.availableData
+                        guard !data.isEmpty else { return }
+                        stderrBuf.append(data)
+                        forwardModelDownloadProgress(data, to: onProgress)
+                    }
+
+                    try process.run()
+
+                    let timeoutItem = DispatchWorkItem {
+                        if process.isRunning { process.terminate() }
+                    }
+                    DispatchQueue.global().asyncAfter(deadline: .now() + 1_800, execute: timeoutItem)
+
+                    process.waitUntilExit()
+                    timeoutItem.cancel()
+
+                    stdoutHandle.readabilityHandler = nil
+                    stderrHandle.readabilityHandler = nil
+
+                    try? FileManager.default.removeItem(at: workDir)
+
+                    if findSenseVoiceModelPath() != nil {
+                        continuation.resume()
+                        return
+                    }
+
+                    let output = [
+                        String(data: stdoutBuf.read(), encoding: .utf8),
+                        String(data: stderrBuf.read(), encoding: .utf8)
+                    ]
+                        .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+                        .filter { !$0.isEmpty }
+                        .joined(separator: "\n")
+
+                    if process.terminationStatus == 0 {
+                        throw TypeNoError.dependencyInstallFailed("Speech model download did not finish.")
+                    } else {
+                        throw TypeNoError.dependencyInstallFailed(output.isEmpty ? "Speech model download failed." : output)
+                    }
+                } catch {
+                    try? FileManager.default.removeItem(at: workDir)
                     continuation.resume(throwing: error)
                 }
             }
@@ -2579,24 +2735,109 @@ final class ColiASRService: @unchecked Sendable {
         return min(max(value, 1_000), 5_000)
     }
 
-    private static func detectIncompleteModelDownload() -> String? {
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        let modelsDir = home.appendingPathComponent(".coli/models", isDirectory: true)
-        let senseVoiceDir = modelsDir.appendingPathComponent(
-            "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17",
-            isDirectory: true
-        )
-        let senseVoiceCheckFile = senseVoiceDir.appendingPathComponent("model.int8.onnx")
-        let senseVoiceArchive = modelsDir.appendingPathComponent(
-            "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17.tar.bz2"
-        )
+    static func findSenseVoiceModelPath() -> String? {
+        let modelDir = senseVoiceModelDirectory()
+        let requiredFiles = [
+            modelDir.appendingPathComponent("model.int8.onnx"),
+            modelDir.appendingPathComponent("tokens.txt")
+        ]
+        let fm = FileManager.default
+        guard requiredFiles.allSatisfy({ fm.fileExists(atPath: $0.path) }) else {
+            return nil
+        }
+        let modelFile = requiredFiles[0]
+        let modelSize = (try? modelFile.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+        guard modelSize > 1_000_000 else {
+            return nil
+        }
+        return modelDir.path
+    }
+
+    static func detectIncompleteModelDownload() -> String? {
+        let modelDir = senseVoiceModelDirectory()
+        let senseVoiceCheckFile = modelDir.appendingPathComponent("model.int8.onnx")
+        let senseVoiceArchive = senseVoiceModelsDirectory().appendingPathComponent("\(senseVoiceModelName).tar.bz2")
 
         let fm = FileManager.default
+        if fm.fileExists(atPath: modelDir.path) && findSenseVoiceModelPath() == nil {
+            return "Coli model cache looks incomplete. Delete \(modelDir.path) and try again."
+        }
         if !fm.fileExists(atPath: senseVoiceCheckFile.path) && fm.fileExists(atPath: senseVoiceArchive.path) {
             return "Coli model download looks incomplete. Delete \(senseVoiceArchive.path) and try again."
         }
 
         return nil
+    }
+
+    private static func senseVoiceModelsDirectory() -> URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".coli/models", isDirectory: true)
+    }
+
+    private static func senseVoiceModelDirectory() -> URL {
+        senseVoiceModelsDirectory().appendingPathComponent(senseVoiceModelName, isDirectory: true)
+    }
+
+    private static func writeSilentWarmupWav(to url: URL) throws {
+        let sampleRate: UInt32 = 16_000
+        let channels: UInt16 = 1
+        let bitsPerSample: UInt16 = 16
+        let frameCount: UInt32 = 1_600
+        let blockAlign = channels * bitsPerSample / 8
+        let byteRate = sampleRate * UInt32(blockAlign)
+        let dataSize = frameCount * UInt32(blockAlign)
+
+        var data = Data()
+        func appendASCII(_ value: String) {
+            data.append(contentsOf: value.utf8)
+        }
+        func appendUInt16LE(_ value: UInt16) {
+            var littleEndian = value.littleEndian
+            withUnsafeBytes(of: &littleEndian) { data.append(contentsOf: $0) }
+        }
+        func appendUInt32LE(_ value: UInt32) {
+            var littleEndian = value.littleEndian
+            withUnsafeBytes(of: &littleEndian) { data.append(contentsOf: $0) }
+        }
+
+        appendASCII("RIFF")
+        appendUInt32LE(36 + dataSize)
+        appendASCII("WAVE")
+        appendASCII("fmt ")
+        appendUInt32LE(16)
+        appendUInt16LE(1)
+        appendUInt16LE(channels)
+        appendUInt32LE(sampleRate)
+        appendUInt32LE(byteRate)
+        appendUInt16LE(blockAlign)
+        appendUInt16LE(bitsPerSample)
+        appendASCII("data")
+        appendUInt32LE(dataSize)
+        data.append(Data(repeating: 0, count: Int(dataSize)))
+
+        try data.write(to: url, options: .atomic)
+    }
+
+    private static func forwardModelDownloadProgress(
+        _ data: Data,
+        to onProgress: @MainActor @Sendable @escaping (String) -> Void
+    ) {
+        guard let chunk = String(data: data, encoding: .utf8) else { return }
+        let lines = chunk
+            .components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        guard let line = lines.last(where: { line in
+            let lower = line.lowercased()
+            return lower.contains("download")
+                || lower.contains("sherpa-onnx")
+                || lower.contains(senseVoiceModelName.lowercased())
+        }) else { return }
+
+        Task { @MainActor in
+            onProgress(L("Downloading SenseVoice model...\n\(line)", "正在下载 SenseVoice 语音模型...\n\(line)"))
+        }
     }
 
     /// Returns a user-friendly error message for common coli failure modes.
@@ -4894,6 +5135,14 @@ struct OverlayView: View {
                     .font(.system(size: 12))
                 }
 
+                if status.canAutoInstallSpeechModel && !appState.autoInstallBlocked(for: .speechModel) {
+                    Button(L("Download model", "下载模型")) {
+                        appState.autoInstallSpeechModel()
+                    }
+                    .buttonStyle(.borderless)
+                    .font(.system(size: 12))
+                }
+
                 Button(L("Copy commands", "复制命令")) {
                     appState.copyDependencySetupCommands()
                 }
@@ -4956,6 +5205,8 @@ struct OverlayView: View {
                     Text(message)
                         .font(.system(size: 11))
                         .foregroundStyle(.secondary)
+                        .lineLimit(3)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
 
                 Spacer()
